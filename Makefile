@@ -1,15 +1,15 @@
-MODULE_big = pg_ducklake_sync
-OBJS = src/pg_ducklake_sync.o src/worker.o src/decoder.o src/batch.o src/apply.o src/api.o
+MODULE_big = pg_duckpipe
+OBJS = src/pg_duckpipe.o src/worker.o src/decoder.o src/batch.o src/apply.o src/api.o
 
-EXTENSION = pg_ducklake_sync
-DATA = sql/pg_ducklake_sync--1.0.sql
-PGFILEDESC = "pg_ducklake_sync - PostgreSQL HTAP Sync Extension"
+EXTENSION = pg_duckpipe
+DATA = sql/pg_duckpipe--1.0.sql
+PGFILEDESC = "pg_duckpipe - PostgreSQL HTAP Sync Extension"
 
 # Disable default installcheck - we define our own with temp instance
 NO_INSTALLCHECK = 1
 
 REGRESS = api streaming snapshot_updates
-REGRESS_OPTS = --temp-config=$(srcdir)/test/ducklake_sync.conf --inputdir=test
+REGRESS_OPTS = --temp-config=$(srcdir)/test/duckpipe.conf --inputdir=test
 
 PG_CONFIG = /Users/xiaoyuwei/Desktop/workspace_ducklake/postgres/work/app/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

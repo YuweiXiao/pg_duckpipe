@@ -1,4 +1,4 @@
-#include "pg_ducklake_sync.h"
+#include "pg_duckpipe.h"
 
 #include "executor/spi.h"
 #include "utils/builtins.h"
@@ -204,7 +204,7 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 							elog(WARNING, "Failed to truncate target table %s.%s", mapping->target_schema,
 							     mapping->target_table);
 						else
-							elog(LOG, "DuckLake Sync: Truncated %s.%s", mapping->target_schema, mapping->target_table);
+							elog(LOG, "DuckPipe: Truncated %s.%s", mapping->target_schema, mapping->target_table);
 
 						pfree(truncate_buf.data);
 					}

@@ -1,4 +1,4 @@
-#include "pg_ducklake_sync.h"
+#include "pg_duckpipe.h"
 
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
@@ -12,12 +12,12 @@
 /* Track background worker handle for stop functionality */
 /* static BackgroundWorkerHandle *worker_handle = NULL; */
 
-PG_FUNCTION_INFO_V1(ducklake_sync_create_group);
+PG_FUNCTION_INFO_V1(duckpipe_create_group);
 Datum
-ducklake_sync_create_group(PG_FUNCTION_ARGS) {
+duckpipe_create_group(PG_FUNCTION_ARGS) {
 	char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char *pub = PG_ARGISNULL(1) ? psprintf("ducklake_sync_pub_%s", name) : text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char *slot = PG_ARGISNULL(2) ? psprintf("ducklake_sync_slot_%s", name) : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char *pub = PG_ARGISNULL(1) ? psprintf("duckpipe_pub_%s", name) : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char *slot = PG_ARGISNULL(2) ? psprintf("duckpipe_slot_%s", name) : text_to_cstring(PG_GETARG_TEXT_PP(2));
 	StringInfoData buf;
 	int ret;
 	Datum values[3];
@@ -46,7 +46,7 @@ ducklake_sync_create_group(PG_FUNCTION_ARGS) {
 	values[1] = CStringGetTextDatum(pub);
 	values[2] = CStringGetTextDatum(slot);
 
-	ret = SPI_execute_with_args("INSERT INTO ducklake_sync.sync_groups (name, "
+	ret = SPI_execute_with_args("INSERT INTO duckpipe.sync_groups (name, "
 	                            "publication, slot_name) VALUES ($1, $2, $3)",
 	                            3, argtypes, values, nulls, false, 0);
 
@@ -58,9 +58,9 @@ ducklake_sync_create_group(PG_FUNCTION_ARGS) {
 	PG_RETURN_TEXT_P(cstring_to_text(name));
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_drop_group);
+PG_FUNCTION_INFO_V1(duckpipe_drop_group);
 Datum
-ducklake_sync_drop_group(PG_FUNCTION_ARGS) {
+duckpipe_drop_group(PG_FUNCTION_ARGS) {
 	char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	bool drop_slot = PG_GETARG_BOOL(1);
 	char *pub;
@@ -75,7 +75,7 @@ ducklake_sync_drop_group(PG_FUNCTION_ARGS) {
 		Datum values[1] = {CStringGetTextDatum(name)};
 		Oid argtypes[1] = {TEXTOID};
 		if (SPI_execute_with_args("SELECT publication, slot_name FROM "
-		                          "ducklake_sync.sync_groups WHERE name = $1",
+		                          "duckpipe.sync_groups WHERE name = $1",
 		                          1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
 			elog(ERROR, "Failed to query sync_groups");
 
@@ -107,7 +107,7 @@ ducklake_sync_drop_group(PG_FUNCTION_ARGS) {
 	{
 		Datum values[1] = {CStringGetTextDatum(name)};
 		Oid argtypes[1] = {TEXTOID};
-		SPI_execute_with_args("DELETE FROM ducklake_sync.sync_groups WHERE name = $1", 1, argtypes, values, NULL, false,
+		SPI_execute_with_args("DELETE FROM duckpipe.sync_groups WHERE name = $1", 1, argtypes, values, NULL, false,
 		                      0);
 	}
 
@@ -116,9 +116,9 @@ ducklake_sync_drop_group(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_enable_group);
+PG_FUNCTION_INFO_V1(duckpipe_enable_group);
 Datum
-ducklake_sync_enable_group(PG_FUNCTION_ARGS) {
+duckpipe_enable_group(PG_FUNCTION_ARGS) {
 	char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int ret;
 
@@ -129,7 +129,7 @@ ducklake_sync_enable_group(PG_FUNCTION_ARGS) {
 		Datum values[1] = {CStringGetTextDatum(name)};
 		Oid argtypes[1] = {TEXTOID};
 
-		ret = SPI_execute_with_args("UPDATE ducklake_sync.sync_groups SET enabled = true WHERE name = $1", 1, argtypes,
+		ret = SPI_execute_with_args("UPDATE duckpipe.sync_groups SET enabled = true WHERE name = $1", 1, argtypes,
 		                            values, NULL, false, 0);
 
 		if (ret != SPI_OK_UPDATE)
@@ -144,9 +144,9 @@ ducklake_sync_enable_group(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_disable_group);
+PG_FUNCTION_INFO_V1(duckpipe_disable_group);
 Datum
-ducklake_sync_disable_group(PG_FUNCTION_ARGS) {
+duckpipe_disable_group(PG_FUNCTION_ARGS) {
 	char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int ret;
 
@@ -157,7 +157,7 @@ ducklake_sync_disable_group(PG_FUNCTION_ARGS) {
 		Datum values[1] = {CStringGetTextDatum(name)};
 		Oid argtypes[1] = {TEXTOID};
 
-		ret = SPI_execute_with_args("UPDATE ducklake_sync.sync_groups SET enabled = false WHERE name = $1", 1, argtypes,
+		ret = SPI_execute_with_args("UPDATE duckpipe.sync_groups SET enabled = false WHERE name = $1", 1, argtypes,
 		                            values, NULL, false, 0);
 
 		if (ret != SPI_OK_UPDATE)
@@ -172,9 +172,9 @@ ducklake_sync_disable_group(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_add_table);
+PG_FUNCTION_INFO_V1(duckpipe_add_table);
 Datum
-ducklake_sync_add_table(PG_FUNCTION_ARGS) {
+duckpipe_add_table(PG_FUNCTION_ARGS) {
 	char *source_table_arg = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char *target_table_arg = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char *group = PG_ARGISNULL(2) ? "default" : text_to_cstring(PG_GETARG_TEXT_PP(2));
@@ -222,7 +222,7 @@ ducklake_sync_add_table(PG_FUNCTION_ARGS) {
 			bool isnull;
 
 			ret = SPI_execute_with_args("SELECT publication, slot_name FROM "
-			                            "ducklake_sync.sync_groups WHERE name = $1",
+			                            "duckpipe.sync_groups WHERE name = $1",
 			                            1, argtypes, values, NULL, true, 1);
 
 			if (ret != SPI_OK_SELECT || SPI_processed == 0)
@@ -298,9 +298,9 @@ ducklake_sync_add_table(PG_FUNCTION_ARGS) {
 			values[4] = CStringGetTextDatum(initial_state);
 			values[5] = CStringGetTextDatum(group);
 
-			ret = SPI_execute_with_args("INSERT INTO ducklake_sync.table_mappings (group_id, source_schema, "
+			ret = SPI_execute_with_args("INSERT INTO duckpipe.table_mappings (group_id, source_schema, "
 			                            "source_table, target_schema, target_table, state) "
-			                            "SELECT id, $1, $2, $3, $4, $5 FROM ducklake_sync.sync_groups WHERE "
+			                            "SELECT id, $1, $2, $3, $4, $5 FROM duckpipe.sync_groups WHERE "
 			                            "name = $6",
 			                            6, argtypes, values, NULL, false, 0);
 
@@ -314,9 +314,9 @@ ducklake_sync_add_table(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_remove_table);
+PG_FUNCTION_INFO_V1(duckpipe_remove_table);
 Datum
-ducklake_sync_remove_table(PG_FUNCTION_ARGS) {
+duckpipe_remove_table(PG_FUNCTION_ARGS) {
 	char *source_table_arg = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	bool drop_target = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
 
@@ -346,8 +346,8 @@ ducklake_sync_remove_table(PG_FUNCTION_ARGS) {
 		bool isnull;
 
 		ret = SPI_execute_with_args("SELECT g.publication, m.target_schema, m.target_table "
-		                            "FROM ducklake_sync.table_mappings m "
-		                            "JOIN ducklake_sync.sync_groups g ON m.group_id = g.id "
+		                            "FROM duckpipe.table_mappings m "
+		                            "JOIN duckpipe.sync_groups g ON m.group_id = g.id "
 		                            "WHERE m.source_schema = $1 AND m.source_table = $2",
 		                            2, argtypes, values, NULL, true, 1);
 
@@ -390,7 +390,7 @@ ducklake_sync_remove_table(PG_FUNCTION_ARGS) {
 		Datum values[2] = {CStringGetTextDatum(schema), CStringGetTextDatum(table)};
 		Oid argtypes[2] = {TEXTOID, TEXTOID};
 
-		ret = SPI_execute_with_args("DELETE FROM ducklake_sync.table_mappings WHERE "
+		ret = SPI_execute_with_args("DELETE FROM duckpipe.table_mappings WHERE "
 		                            "source_schema = $1 AND source_table = $2",
 		                            2, argtypes, values, NULL, false, 0);
 
@@ -402,9 +402,9 @@ ducklake_sync_remove_table(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_move_table);
+PG_FUNCTION_INFO_V1(duckpipe_move_table);
 Datum
-ducklake_sync_move_table(PG_FUNCTION_ARGS) {
+duckpipe_move_table(PG_FUNCTION_ARGS) {
 	char *source_table_arg = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char *new_group = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
@@ -431,8 +431,8 @@ ducklake_sync_move_table(PG_FUNCTION_ARGS) {
 		values[2] = CStringGetTextDatum(table);
 
 		{
-			int ret = SPI_execute_with_args("UPDATE ducklake_sync.table_mappings SET group_id = (SELECT id FROM "
-			                                "ducklake_sync.sync_groups WHERE name = $1) "
+			int ret = SPI_execute_with_args("UPDATE duckpipe.table_mappings SET group_id = (SELECT id FROM "
+			                                "duckpipe.sync_groups WHERE name = $1) "
 			                                "WHERE source_schema = $2 AND source_table = $3",
 			                                3, argtypes, values, NULL, false, 0);
 
@@ -445,9 +445,9 @@ ducklake_sync_move_table(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_resync_table);
+PG_FUNCTION_INFO_V1(duckpipe_resync_table);
 Datum
-ducklake_sync_resync_table(PG_FUNCTION_ARGS) {
+duckpipe_resync_table(PG_FUNCTION_ARGS) {
 	char *source_table_arg = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char *source_copy = pstrdup(source_table_arg);
 	char *schema = "public";
@@ -472,7 +472,7 @@ ducklake_sync_resync_table(PG_FUNCTION_ARGS) {
 		Oid argtypes[2] = {TEXTOID, TEXTOID};
 		bool isnull;
 
-		ret = SPI_execute_with_args("SELECT target_schema, target_table FROM ducklake_sync.table_mappings "
+		ret = SPI_execute_with_args("SELECT target_schema, target_table FROM duckpipe.table_mappings "
 		                            "WHERE source_schema = $1 AND source_table = $2",
 		                            2, argtypes, values, NULL, true, 1);
 
@@ -500,7 +500,7 @@ ducklake_sync_resync_table(PG_FUNCTION_ARGS) {
 		Datum values[2] = {CStringGetTextDatum(schema), CStringGetTextDatum(table)};
 		Oid argtypes[2] = {TEXTOID, TEXTOID};
 
-		ret = SPI_execute_with_args("UPDATE ducklake_sync.table_mappings SET state = 'SNAPSHOT', "
+		ret = SPI_execute_with_args("UPDATE duckpipe.table_mappings SET state = 'SNAPSHOT', "
 		                            "rows_synced = 0, last_sync_at = NULL "
 		                            "WHERE source_schema = $1 AND source_table = $2",
 		                            2, argtypes, values, NULL, false, 0);
@@ -514,9 +514,9 @@ ducklake_sync_resync_table(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_groups);
+PG_FUNCTION_INFO_V1(duckpipe_groups);
 Datum
-ducklake_sync_groups(PG_FUNCTION_ARGS) {
+duckpipe_groups(PG_FUNCTION_ARGS) {
 	FuncCallContext *funcctx;
 	int call_cntr;
 	int max_calls;
@@ -548,12 +548,12 @@ ducklake_sync_groups(PG_FUNCTION_ARGS) {
 			elog(ERROR, "SPI_connect failed");
 
 		ret = SPI_execute("SELECT g.name, g.publication, g.slot_name, g.enabled, "
-		                  "       (SELECT count(*) FROM ducklake_sync.table_mappings "
+		                  "       (SELECT count(*) FROM duckpipe.table_mappings "
 		                  "m WHERE m.group_id = g.id)::int4 as table_count, "
 		                  "       COALESCE(pg_current_wal_lsn() - g.confirmed_lsn, "
 		                  "0)::int8 as lag_bytes, "
 		                  "       g.last_sync_at "
-		                  "FROM ducklake_sync.sync_groups g "
+		                  "FROM duckpipe.sync_groups g "
 		                  "ORDER BY g.name",
 		                  true, 0);
 
@@ -596,9 +596,9 @@ ducklake_sync_groups(PG_FUNCTION_ARGS) {
 	}
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_tables);
+PG_FUNCTION_INFO_V1(duckpipe_tables);
 Datum
-ducklake_sync_tables(PG_FUNCTION_ARGS) {
+duckpipe_tables(PG_FUNCTION_ARGS) {
 	FuncCallContext *funcctx;
 	int call_cntr;
 	int max_calls;
@@ -632,8 +632,8 @@ ducklake_sync_tables(PG_FUNCTION_ARGS) {
 		                  "       m.target_schema || '.' || m.target_table as target_table, "
 		                  "       g.name as sync_group, "
 		                  "       m.enabled, m.rows_synced, m.last_sync_at "
-		                  "FROM ducklake_sync.table_mappings m "
-		                  "JOIN ducklake_sync.sync_groups g ON m.group_id = g.id "
+		                  "FROM duckpipe.table_mappings m "
+		                  "JOIN duckpipe.sync_groups g ON m.group_id = g.id "
 		                  "ORDER BY g.name, m.source_schema, m.source_table",
 		                  true, 0);
 
@@ -676,9 +676,9 @@ ducklake_sync_tables(PG_FUNCTION_ARGS) {
 	}
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_status);
+PG_FUNCTION_INFO_V1(duckpipe_status);
 Datum
-ducklake_sync_status(PG_FUNCTION_ARGS) {
+duckpipe_status(PG_FUNCTION_ARGS) {
 	FuncCallContext *funcctx;
 	int call_cntr;
 	int max_calls;
@@ -713,8 +713,8 @@ ducklake_sync_status(PG_FUNCTION_ARGS) {
 		                  "       m.source_schema || '.' || m.source_table as source_table, "
 		                  "       m.target_schema || '.' || m.target_table as target_table, "
 		                  "       m.state, m.enabled, m.rows_synced, m.last_sync_at "
-		                  "FROM ducklake_sync.table_mappings m "
-		                  "JOIN ducklake_sync.sync_groups g ON m.group_id = g.id "
+		                  "FROM duckpipe.table_mappings m "
+		                  "JOIN duckpipe.sync_groups g ON m.group_id = g.id "
 		                  "ORDER BY g.name, m.source_schema, m.source_table",
 		                  true, 0);
 
@@ -757,12 +757,12 @@ ducklake_sync_status(PG_FUNCTION_ARGS) {
 	}
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_start_worker);
+PG_FUNCTION_INFO_V1(duckpipe_start_worker);
 Datum
-ducklake_sync_start_worker(PG_FUNCTION_ARGS) {
+duckpipe_start_worker(PG_FUNCTION_ARGS) {
 	BackgroundWorker worker;
 	char *dbname;
-	char *bgw_type = "pg_ducklake_sync";
+	char *bgw_type = "pg_duckpipe";
 	bool running = false;
 
 	dbname = get_database_name(MyDatabaseId);
@@ -795,9 +795,9 @@ ducklake_sync_start_worker(PG_FUNCTION_ARGS) {
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_ducklake_sync");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "ducklake_sync_worker_main");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_ducklake_sync worker [%s]", dbname);
+	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_duckpipe");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "duckpipe_worker_main");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_duckpipe worker [%s]", dbname);
 	snprintf(worker.bgw_type, BGW_MAXLEN, "%s", bgw_type);
 	worker.bgw_main_arg = ObjectIdGetDatum(MyDatabaseId);
 	worker.bgw_notify_pid = MyProcPid;
@@ -809,10 +809,10 @@ ducklake_sync_start_worker(PG_FUNCTION_ARGS) {
 	PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(ducklake_sync_stop_worker);
+PG_FUNCTION_INFO_V1(duckpipe_stop_worker);
 Datum
-ducklake_sync_stop_worker(PG_FUNCTION_ARGS) {
-	char *bgw_type = "pg_ducklake_sync";
+duckpipe_stop_worker(PG_FUNCTION_ARGS) {
+	char *bgw_type = "pg_duckpipe";
 	int terminated_count = 0;
 
 	if (SPI_connect() != SPI_OK_CONNECT)

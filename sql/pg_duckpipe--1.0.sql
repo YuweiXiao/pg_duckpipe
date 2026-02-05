@@ -1,10 +1,10 @@
 -- Complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION pg_ducklake_sync" to load this file. \quit
+\echo Use "CREATE EXTENSION pg_duckpipe" to load this file. \quit
 
--- Schema is created by the extension (schema = 'ducklake_sync' in control file)
+-- Schema is created by the extension (schema = 'duckpipe' in control file)
 
 -- Sync groups
-CREATE TABLE ducklake_sync.sync_groups (
+CREATE TABLE duckpipe.sync_groups (
     id              SERIAL PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
     publication     TEXT NOT NULL UNIQUE,
@@ -16,9 +16,9 @@ CREATE TABLE ducklake_sync.sync_groups (
 );
 
 -- Table mappings
-CREATE TABLE ducklake_sync.table_mappings (
+CREATE TABLE duckpipe.table_mappings (
     id              SERIAL PRIMARY KEY,
-    group_id        INTEGER NOT NULL REFERENCES ducklake_sync.sync_groups(id),
+    group_id        INTEGER NOT NULL REFERENCES duckpipe.sync_groups(id),
     source_schema   TEXT NOT NULL,
     source_table    TEXT NOT NULL,
     target_schema   TEXT NOT NULL,
@@ -33,8 +33,8 @@ CREATE TABLE ducklake_sync.table_mappings (
 );
 
 -- Relation cache
-CREATE TABLE ducklake_sync.relation_cache (
-    group_id        INTEGER REFERENCES ducklake_sync.sync_groups(id),
+CREATE TABLE duckpipe.relation_cache (
+    group_id        INTEGER REFERENCES duckpipe.sync_groups(id),
     remote_relid    INTEGER,
     source_schema   TEXT,
     source_table    TEXT,
@@ -43,64 +43,64 @@ CREATE TABLE ducklake_sync.relation_cache (
 );
 
 -- Default sync group
-INSERT INTO ducklake_sync.sync_groups (name, publication, slot_name)
-VALUES ('default', 
-        'ducklake_sync_pub_' || current_database(), 
-        'ducklake_sync_slot_' || current_database());
+INSERT INTO duckpipe.sync_groups (name, publication, slot_name)
+VALUES ('default',
+        'duckpipe_pub_' || current_database(),
+        'duckpipe_slot_' || current_database());
 
 -- API Functions
-CREATE FUNCTION ducklake_sync.create_group(
+CREATE FUNCTION duckpipe.create_group(
     name TEXT,
     publication TEXT DEFAULT NULL,
     slot_name TEXT DEFAULT NULL
 ) RETURNS TEXT
-AS 'MODULE_PATHNAME', 'ducklake_sync_create_group'
+AS 'MODULE_PATHNAME', 'duckpipe_create_group'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.drop_group(
+CREATE FUNCTION duckpipe.drop_group(
     name TEXT,
     drop_slot BOOLEAN DEFAULT true
 ) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_drop_group'
+AS 'MODULE_PATHNAME', 'duckpipe_drop_group'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.enable_group(name TEXT) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_enable_group'
+CREATE FUNCTION duckpipe.enable_group(name TEXT) RETURNS void
+AS 'MODULE_PATHNAME', 'duckpipe_enable_group'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.disable_group(name TEXT) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_disable_group'
+CREATE FUNCTION duckpipe.disable_group(name TEXT) RETURNS void
+AS 'MODULE_PATHNAME', 'duckpipe_disable_group'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.add_table(
+CREATE FUNCTION duckpipe.add_table(
     source_table TEXT,
     target_table TEXT DEFAULT NULL,
     sync_group TEXT DEFAULT 'default',
     copy_data BOOLEAN DEFAULT true
 ) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_add_table'
+AS 'MODULE_PATHNAME', 'duckpipe_add_table'
 LANGUAGE C;
 
-CREATE FUNCTION ducklake_sync.remove_table(
+CREATE FUNCTION duckpipe.remove_table(
     source_table TEXT,
     drop_target BOOLEAN DEFAULT false
 ) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_remove_table'
+AS 'MODULE_PATHNAME', 'duckpipe_remove_table'
 LANGUAGE C;
 
-CREATE FUNCTION ducklake_sync.move_table(
+CREATE FUNCTION duckpipe.move_table(
     source_table TEXT,
     new_group TEXT
 ) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_move_table'
+AS 'MODULE_PATHNAME', 'duckpipe_move_table'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.resync_table(source_table TEXT) RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_resync_table'
+CREATE FUNCTION duckpipe.resync_table(source_table TEXT) RETURNS void
+AS 'MODULE_PATHNAME', 'duckpipe_resync_table'
 LANGUAGE C STRICT;
 
 -- Monitoring Views
-CREATE FUNCTION ducklake_sync.groups() RETURNS TABLE(
+CREATE FUNCTION duckpipe.groups() RETURNS TABLE(
     name TEXT,
     publication TEXT,
     slot_name TEXT,
@@ -109,10 +109,10 @@ CREATE FUNCTION ducklake_sync.groups() RETURNS TABLE(
     lag_bytes BIGINT,
     last_sync TIMESTAMPTZ
 )
-AS 'MODULE_PATHNAME', 'ducklake_sync_groups'
+AS 'MODULE_PATHNAME', 'duckpipe_groups'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.tables() RETURNS TABLE(
+CREATE FUNCTION duckpipe.tables() RETURNS TABLE(
     source_table TEXT,
     target_table TEXT,
     sync_group TEXT,
@@ -120,10 +120,10 @@ CREATE FUNCTION ducklake_sync.tables() RETURNS TABLE(
     rows_synced BIGINT,
     last_sync TIMESTAMPTZ
 )
-AS 'MODULE_PATHNAME', 'ducklake_sync_tables'
+AS 'MODULE_PATHNAME', 'duckpipe_tables'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.status() RETURNS TABLE(
+CREATE FUNCTION duckpipe.status() RETURNS TABLE(
     sync_group TEXT,
     source_table TEXT,
     target_table TEXT,
@@ -132,13 +132,13 @@ CREATE FUNCTION ducklake_sync.status() RETURNS TABLE(
     rows_synced BIGINT,
     last_sync TIMESTAMPTZ
 )
-AS 'MODULE_PATHNAME', 'ducklake_sync_status'
+AS 'MODULE_PATHNAME', 'duckpipe_status'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION ducklake_sync.start_worker() RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_start_worker'
+CREATE FUNCTION duckpipe.start_worker() RETURNS void
+AS 'MODULE_PATHNAME', 'duckpipe_start_worker'
 LANGUAGE C;
 
-CREATE FUNCTION ducklake_sync.stop_worker() RETURNS void
-AS 'MODULE_PATHNAME', 'ducklake_sync_stop_worker'
+CREATE FUNCTION duckpipe.stop_worker() RETURNS void
+AS 'MODULE_PATHNAME', 'duckpipe_stop_worker'
 LANGUAGE C;

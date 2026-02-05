@@ -1,4 +1,4 @@
-#include "pg_ducklake_sync.h"
+#include "pg_duckpipe.h"
 
 #include "executor/spi.h"
 #include "utils/builtins.h"

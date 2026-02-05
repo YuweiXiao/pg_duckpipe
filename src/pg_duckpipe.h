@@ -1,5 +1,5 @@
-#ifndef PG_DUCKLAKE_SYNC_H
-#define PG_DUCKLAKE_SYNC_H
+#ifndef PG_DUCKPIPE_H
+#define PG_DUCKPIPE_H
 
 #include "postgres.h"
 
@@ -21,10 +21,10 @@
 #include "utils/wait_event.h"
 
 /* GUC variables */
-extern int ducklake_sync_poll_interval;
-extern int ducklake_sync_batch_size_per_table;
-extern int ducklake_sync_batch_size_per_group;
-extern bool ducklake_sync_enabled;
+extern int duckpipe_poll_interval;
+extern int duckpipe_batch_size_per_table;
+extern int duckpipe_batch_size_per_group;
+extern bool duckpipe_enabled;
 
 /* Data Structures */
 typedef struct SyncGroup {
@@ -82,7 +82,7 @@ typedef struct SyncBatch {
 } SyncBatch;
 
 /* Worker functions */
-extern PGDLLEXPORT void ducklake_sync_worker_main(Datum main_arg);
+extern PGDLLEXPORT void duckpipe_worker_main(Datum main_arg);
 extern int process_sync_group(SyncGroup *group);
 
 /* Decoder functions */
@@ -99,4 +99,4 @@ extern void apply_batch(SyncBatch *batch);
 extern List *get_enabled_sync_groups(void);
 extern TableMapping *get_table_mapping(SyncGroup *group, char *schemaname, char *relname);
 
-#endif /* PG_DUCKLAKE_SYNC_H */
+#endif /* PG_DUCKPIPE_H */

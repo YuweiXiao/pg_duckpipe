@@ -1,4 +1,4 @@
-#include "pg_ducklake_sync.h"
+#include "pg_duckpipe.h"
 
 #include "nodes/bitmapset.h"
 #include "utils/memutils.h"
@@ -65,7 +65,7 @@ batch_add_change(HTAB *batches, TableMapping *mapping, SyncChange *change, Logic
 	batch->last_lsn = change->lsn;
 
 	/* Flush if full */
-	if (batch->count >= ducklake_sync_batch_size_per_table) {
+	if (batch->count >= duckpipe_batch_size_per_table) {
 		apply_batch(batch);
 
 		/* Reset batch - keep attnames/keyattrs but clear changes */

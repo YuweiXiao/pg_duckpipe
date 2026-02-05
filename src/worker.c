@@ -1,4 +1,4 @@
-#include "pg_ducklake_sync.h"
+#include "pg_duckpipe.h"
 
 #include "access/xlog.h"
 #include "catalog/pg_type.h"
@@ -17,7 +17,7 @@ static volatile sig_atomic_t got_sigterm = false;
 static MemoryContext SyncMemoryContext = NULL;
 
 static void
-ducklake_sync_sighup(SIGNAL_ARGS) {
+duckpipe_sighup(SIGNAL_ARGS) {
 	int save_errno = errno;
 	got_sighup = true;
 	SetLatch(MyLatch);
@@ -25,7 +25,7 @@ ducklake_sync_sighup(SIGNAL_ARGS) {
 }
 
 static void
-ducklake_sync_sigterm(SIGNAL_ARGS) {
+duckpipe_sigterm(SIGNAL_ARGS) {
 	int save_errno = errno;
 	got_sigterm = true;
 	SetLatch(MyLatch);
@@ -39,7 +39,7 @@ get_enabled_sync_groups(void) {
 	int ret;
 
 	ret = SPI_execute("SELECT id, name, publication, slot_name FROM "
-	                  "ducklake_sync.sync_groups WHERE enabled = true",
+	                  "duckpipe.sync_groups WHERE enabled = true",
 	                  true, 0);
 
 	if (ret == SPI_OK_SELECT) {
@@ -81,7 +81,7 @@ get_table_mapping(SyncGroup *group, char *schemaname, char *relname) {
 	ret = SPI_execute_with_args("SELECT id, group_id, source_schema, source_table, target_schema, "
 	                            "target_table, "
 	                            "       state, snapshot_lsn, enabled "
-	                            "FROM ducklake_sync.table_mappings "
+	                            "FROM duckpipe.table_mappings "
 	                            "WHERE group_id = $1 AND source_schema = $2 AND source_table = $3",
 	                            3, argtypes, values, NULL, true, 1);
 
@@ -150,7 +150,7 @@ process_snapshot(SyncGroup *group) {
 	MemoryContext oldcxt;
 
 	ret = SPI_execute_with_args("SELECT id, source_schema, source_table, target_schema, target_table "
-	                            "FROM ducklake_sync.table_mappings "
+	                            "FROM duckpipe.table_mappings "
 	                            "WHERE group_id = $1 AND state = 'SNAPSHOT' AND enabled = true",
 	                            1, (Oid[]) {INT4OID}, (Datum[]) {Int32GetDatum(group->id)}, NULL, true, 0);
 
@@ -190,7 +190,7 @@ process_snapshot(SyncGroup *group) {
 			                 quote_identifier(task->t_table), quote_identifier(task->s_schema),
 			                 quote_identifier(task->s_table));
 
-			elog(LOG, "DuckLake Sync: Copying data for %s.%s", task->s_schema, task->s_table);
+			elog(LOG, "DuckPipe: Copying data for %s.%s", task->s_schema, task->s_table);
 
 			/* DuckDB Write */
 			if (SPI_execute(buf.data, false, 0) < 0) {
@@ -208,7 +208,7 @@ process_snapshot(SyncGroup *group) {
 			{
 				Datum values[1] = {Int32GetDatum(task->id)};
 				Oid argtypes[1] = {INT4OID};
-				SPI_execute_with_args("UPDATE ducklake_sync.table_mappings SET state = 'STREAMING' WHERE id = $1", 1,
+				SPI_execute_with_args("UPDATE duckpipe.table_mappings SET state = 'STREAMING' WHERE id = $1", 1,
 				                      argtypes, values, NULL, false, 0);
 			}
 
@@ -258,7 +258,7 @@ process_sync_group(SyncGroup *group) {
 	appendStringInfo(&query,
 	                 "SELECT lsn, data FROM pg_logical_slot_get_binary_changes("
 	                 "%s, NULL, %d, 'proto_version', '1', 'publication_names', %s)",
-	                 quote_literal_cstr(group->slot_name), ducklake_sync_batch_size_per_group,
+	                 quote_literal_cstr(group->slot_name), duckpipe_batch_size_per_group,
 	                 quote_literal_cstr(group->publication));
 
 	ret = SPI_execute(query.data, true, 0);
@@ -311,12 +311,12 @@ process_sync_group(SyncGroup *group) {
 }
 
 PGDLLEXPORT void
-ducklake_sync_worker_main(Datum main_arg) {
+duckpipe_worker_main(Datum main_arg) {
 	Oid dboid = DatumGetObjectId(main_arg);
 	char *dbname;
 
-	pqsignal(SIGHUP, ducklake_sync_sighup);
-	pqsignal(SIGTERM, ducklake_sync_sigterm);
+	pqsignal(SIGHUP, duckpipe_sighup);
+	pqsignal(SIGTERM, duckpipe_sigterm);
 	BackgroundWorkerUnblockSignals();
 
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
@@ -334,9 +334,9 @@ ducklake_sync_worker_main(Datum main_arg) {
 	if (dbname == NULL)
 		elog(FATAL, "database with OID %u does not exist", dboid);
 
-	SyncMemoryContext = AllocSetContextCreate(TopMemoryContext, "pg_ducklake_sync", ALLOCSET_DEFAULT_SIZES);
+	SyncMemoryContext = AllocSetContextCreate(TopMemoryContext, "pg_duckpipe", ALLOCSET_DEFAULT_SIZES);
 
-	elog(LOG, "pg_ducklake_sync worker started for database '%s'", dbname);
+	elog(LOG, "pg_duckpipe worker started for database '%s'", dbname);
 
 	while (!got_sigterm) {
 		List *groups;
@@ -350,8 +350,8 @@ ducklake_sync_worker_main(Datum main_arg) {
 		}
 
 		/* Skip if disabled */
-		if (!ducklake_sync_enabled) {
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, ducklake_sync_poll_interval,
+		if (!duckpipe_enabled) {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, duckpipe_poll_interval,
 			                PG_WAIT_EXTENSION);
 			ResetLatch(MyLatch);
 			continue;
@@ -389,10 +389,10 @@ ducklake_sync_worker_main(Datum main_arg) {
 
 		/* Wait before next poll (shorter if there was work) */
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-		                any_work ? 10 : ducklake_sync_poll_interval, PG_WAIT_EXTENSION);
+		                any_work ? 10 : duckpipe_poll_interval, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 	}
 
-	elog(LOG, "pg_ducklake_sync worker shutting down");
+	elog(LOG, "pg_duckpipe worker shutting down");
 	proc_exit(0);
 }
