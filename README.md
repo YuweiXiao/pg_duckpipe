@@ -109,6 +109,19 @@ SET ducklake_sync.batch_size_per_group = 10000; -- fairness between groups
 - pg_ducklake extension
 - Source tables must have PRIMARY KEY
 
+## Building
+
+```bash
+make
+make install
+```
+
+## Running Tests
+
+```bash
+make installcheck
+```
+
 ## Performance
 
 | Metric | Typical Value |
