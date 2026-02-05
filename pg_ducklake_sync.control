@@ -1,0 +1,6 @@
+comment = 'PostgreSQL HTAP Sync Extension'
+default_version = '1.0'
+module_pathname = '$libdir/pg_ducklake_sync'
+relocatable = false
+schema = 'ducklake_sync'
+requires = 'pg_duckdb'

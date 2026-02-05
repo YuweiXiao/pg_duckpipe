@@ -1,0 +1,38 @@
+# Compiled object files
+*.o
+*.bc
+
+# Shared libraries
+*.so
+*.dylib
+*.dll
+
+# Static libraries
+*.a
+
+# PostgreSQL extension artifacts
+*.pc
+
+# Regression test output
+results/
+regression.diffs
+regression.out
+tmp_check/
+tmp_check_iso/
+log/
+output_iso/
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# macOS
+.DS_Store
+
+# Build directories
+build/
+tmp_test/
