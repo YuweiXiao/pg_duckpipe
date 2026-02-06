@@ -83,7 +83,7 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 			return;
 
 		/* During CATCHUP, skip changes already included in snapshot */
-		if (strcmp(mapping->state, "CATCHUP") == 0 && mapping->snapshot_lsn != InvalidXLogRecPtr &&
+		if (mapping->state == SYNC_STATE_CATCHUP && mapping->snapshot_lsn != InvalidXLogRecPtr &&
 		    lsn <= mapping->snapshot_lsn)
 			return;
 
@@ -116,7 +116,7 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 			return;
 
 		/* During CATCHUP, skip changes already included in snapshot */
-		if (strcmp(mapping->state, "CATCHUP") == 0 && mapping->snapshot_lsn != InvalidXLogRecPtr &&
+		if (mapping->state == SYNC_STATE_CATCHUP && mapping->snapshot_lsn != InvalidXLogRecPtr &&
 		    lsn <= mapping->snapshot_lsn)
 			return;
 
@@ -166,7 +166,7 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 			return;
 
 		/* During CATCHUP, skip changes already included in snapshot */
-		if (strcmp(mapping->state, "CATCHUP") == 0 && mapping->snapshot_lsn != InvalidXLogRecPtr &&
+		if (mapping->state == SYNC_STATE_CATCHUP && mapping->snapshot_lsn != InvalidXLogRecPtr &&
 		    lsn <= mapping->snapshot_lsn)
 			return;
 

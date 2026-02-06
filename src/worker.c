@@ -96,7 +96,7 @@ get_table_mapping(SyncGroup *group, char *schemaname, char *relname) {
 		mapping->source_table = pstrdup(TextDatumGetCString(SPI_getbinval(tuple, tupdesc, 4, &isnull)));
 		mapping->target_schema = pstrdup(TextDatumGetCString(SPI_getbinval(tuple, tupdesc, 5, &isnull)));
 		mapping->target_table = pstrdup(TextDatumGetCString(SPI_getbinval(tuple, tupdesc, 6, &isnull)));
-		mapping->state = pstrdup(TextDatumGetCString(SPI_getbinval(tuple, tupdesc, 7, &isnull)));
+		mapping->state = sync_state_from_string(TextDatumGetCString(SPI_getbinval(tuple, tupdesc, 7, &isnull)));
 
 		lsn_datum = SPI_getbinval(tuple, tupdesc, 8, &isnull);
 		mapping->snapshot_lsn = isnull ? InvalidXLogRecPtr : DatumGetLSN(lsn_datum);

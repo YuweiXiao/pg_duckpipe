@@ -293,7 +293,7 @@ duckpipe_add_table(PG_FUNCTION_ARGS) {
 		{
 			Datum values[6];
 			Oid argtypes[6] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID};
-			char *initial_state = copy_data ? "SNAPSHOT" : "STREAMING";
+			const char *initial_state = sync_state_to_string(copy_data ? SYNC_STATE_SNAPSHOT : SYNC_STATE_STREAMING);
 
 			values[0] = CStringGetTextDatum(schema);
 			values[1] = CStringGetTextDatum(table);

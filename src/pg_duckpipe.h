@@ -3,6 +3,8 @@
 
 #include "postgres.h"
 
+#include <string.h>
+
 #include "access/xlogdefs.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -26,6 +28,38 @@ extern int duckpipe_batch_size_per_table;
 extern int duckpipe_batch_size_per_group;
 extern bool duckpipe_enabled;
 
+/* Sync state machine: PENDING → SNAPSHOT → CATCHUP → STREAMING */
+typedef enum SyncState { SYNC_STATE_PENDING, SYNC_STATE_SNAPSHOT, SYNC_STATE_CATCHUP, SYNC_STATE_STREAMING } SyncState;
+
+static inline const char *
+sync_state_to_string(SyncState state) {
+	switch (state) {
+	case SYNC_STATE_PENDING:
+		return "PENDING";
+	case SYNC_STATE_SNAPSHOT:
+		return "SNAPSHOT";
+	case SYNC_STATE_CATCHUP:
+		return "CATCHUP";
+	case SYNC_STATE_STREAMING:
+		return "STREAMING";
+	}
+	return "UNKNOWN";
+}
+
+static inline SyncState
+sync_state_from_string(const char *str) {
+	if (strcmp(str, "PENDING") == 0)
+		return SYNC_STATE_PENDING;
+	if (strcmp(str, "SNAPSHOT") == 0)
+		return SYNC_STATE_SNAPSHOT;
+	if (strcmp(str, "CATCHUP") == 0)
+		return SYNC_STATE_CATCHUP;
+	if (strcmp(str, "STREAMING") == 0)
+		return SYNC_STATE_STREAMING;
+	elog(ERROR, "unknown sync state: %s", str);
+	return SYNC_STATE_PENDING; /* unreachable */
+}
+
 /* Data Structures */
 typedef struct SyncGroup {
 	int id;
@@ -42,7 +76,7 @@ typedef struct TableMapping {
 	char *source_table;
 	char *target_schema;
 	char *target_table;
-	char *state; /* PENDING, SNAPSHOT, CATCHUP, STREAMING */
+	SyncState state;
 	XLogRecPtr snapshot_lsn;
 	bool enabled;
 } TableMapping;
