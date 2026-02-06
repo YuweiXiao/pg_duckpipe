@@ -62,6 +62,12 @@ duckpipe.batch_size_per_group   -- total changes per group per round (default 10
 duckpipe.enabled                -- enable/disable worker (default on)
 ```
 
+## Worker Lifecycle
+
+- **Auto-start**: `add_table()` automatically starts a background worker if one is not already running for the current database. No explicit `start_worker()` call is needed.
+- **Manual start**: `start_worker()` is still available as an explicit override.
+- **Stop**: `stop_worker()` terminates the worker. The worker has `bgw_restart_time = 10` so it auto-restarts after crash; to pause, use `ALTER SYSTEM SET duckpipe.enabled = off; SELECT pg_reload_conf();`
+
 ## Test Files
 
 Tests are in `test/regression/sql/` with expected output in `test/regression/expected/`:

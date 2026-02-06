@@ -1,6 +1,5 @@
 -- Test API functions and metadata management
 CREATE EXTENSION pg_duckpipe CASCADE;
-NOTICE:  installing required extension "pg_duckdb"
 -- Verify default group exists
 SELECT name, publication, slot_name FROM duckpipe.sync_groups;
   name   |       publication       |        slot_name         

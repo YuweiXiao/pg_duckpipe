@@ -9,8 +9,44 @@
 #include "storage/ipc.h"
 #include "utils/builtins.h"
 
-/* Track background worker handle for stop functionality */
-/* static BackgroundWorkerHandle *worker_handle = NULL; */
+/*
+ * Check if a pg_duckpipe worker is running for the current database.
+ * Returns true if a worker is already running, false otherwise.
+ * Requires an active SPI connection.
+ */
+static bool
+is_worker_running(void) {
+	char *bgw_type = "pg_duckpipe";
+	Datum values[1] = {CStringGetTextDatum(bgw_type)};
+	Oid argtypes[1] = {TEXTOID};
+
+	int ret = SPI_execute_with_args("SELECT 1 FROM pg_stat_activity WHERE backend_type = $1", 1, argtypes, values, NULL,
+	                                true, 1);
+
+	return (ret == SPI_OK_SELECT && SPI_processed > 0);
+}
+
+/*
+ * Register and start a dynamic background worker for the current database.
+ */
+static bool
+launch_worker(void) {
+	BackgroundWorker worker;
+	char *dbname = get_database_name(MyDatabaseId);
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 10;
+	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_duckpipe");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "duckpipe_worker_main");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_duckpipe worker [%s]", dbname);
+	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_duckpipe");
+	worker.bgw_main_arg = ObjectIdGetDatum(MyDatabaseId);
+	worker.bgw_notify_pid = MyProcPid;
+
+	return RegisterDynamicBackgroundWorker(&worker, NULL);
+}
 
 PG_FUNCTION_INFO_V1(duckpipe_create_group);
 Datum
@@ -313,6 +349,11 @@ duckpipe_add_table(PG_FUNCTION_ARGS) {
 		}
 
 		pfree(buf.data);
+
+		/* Auto-start background worker if not already running */
+		if (!is_worker_running())
+			launch_worker();
+
 		SPI_finish();
 	}
 	PG_RETURN_VOID();
@@ -770,49 +811,23 @@ duckpipe_status(PG_FUNCTION_ARGS) {
 PG_FUNCTION_INFO_V1(duckpipe_start_worker);
 Datum
 duckpipe_start_worker(PG_FUNCTION_ARGS) {
-	BackgroundWorker worker;
-	char *dbname;
-	char *bgw_type = "pg_duckpipe";
-	bool running = false;
+	char *dbname = get_database_name(MyDatabaseId);
 
-	dbname = get_database_name(MyDatabaseId);
 	if (dbname == NULL)
 		elog(ERROR, "Could not get current database name");
 
-	/* Check if worker is already running using pg_stat_activity */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 
-	{
-		Datum values[1] = {CStringGetTextDatum(bgw_type)};
-		Oid argtypes[1] = {TEXTOID};
-
-		int ret = SPI_execute_with_args("SELECT 1 FROM pg_stat_activity WHERE backend_type = $1", 1, argtypes, values,
-		                                NULL, true, 0);
-
-		if (ret == SPI_OK_SELECT && SPI_processed > 0)
-			running = true;
-	}
-	SPI_finish();
-
-	if (running) {
+	if (is_worker_running()) {
+		SPI_finish();
 		elog(NOTICE, "Worker already running for database %s", dbname);
 		PG_RETURN_VOID();
 	}
 
-	/* Start new worker */
-	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = 10; /* auto-restart after 10 seconds */
-	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_duckpipe");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "duckpipe_worker_main");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_duckpipe worker [%s]", dbname);
-	snprintf(worker.bgw_type, BGW_MAXLEN, "%s", bgw_type);
-	worker.bgw_main_arg = ObjectIdGetDatum(MyDatabaseId);
-	worker.bgw_notify_pid = MyProcPid;
+	SPI_finish();
 
-	if (!RegisterDynamicBackgroundWorker(&worker, NULL))
+	if (!launch_worker())
 		elog(ERROR, "Failed to start background worker for database %s", dbname);
 
 	elog(NOTICE, "Background worker started for database %s", dbname);

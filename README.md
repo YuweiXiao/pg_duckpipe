@@ -35,14 +35,12 @@ PostgreSQL extension for HTAP (Hybrid Transactional/Analytical Processing) synch
 -- Install extension (CASCADE pulls in pg_duckdb)
 CREATE EXTENSION pg_duckpipe CASCADE;
 
--- Start the CDC worker
-SELECT duckpipe.start_worker();
-
 -- Create source and target tables
 CREATE TABLE orders (id SERIAL PRIMARY KEY, customer_id INT, amount NUMERIC);
 CREATE TABLE ducklake.orders (id INT, customer_id INT, amount NUMERIC) USING ducklake;
 
 -- Add table to sync (copies existing data + streams changes)
+-- The background worker starts automatically if not already running
 SELECT duckpipe.add_table('public.orders', 'ducklake.orders');
 
 -- OLTP operations work normally

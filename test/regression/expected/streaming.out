@@ -1,6 +1,6 @@
 CREATE EXTENSION pg_duckpipe CASCADE;
 SELECT duckpipe.start_worker();
-NOTICE:  Background worker started for database regression
+NOTICE:  Worker already running for database regression
  start_worker 
 --------------
  

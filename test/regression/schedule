@@ -1,4 +1,6 @@
 # pg_duckpipe regression test schedule
+# Auto-start test (must run first on fresh instance with no worker)
+test: auto_start
 # API and monitoring tests (no background worker needed)
 test: api
 test: monitoring

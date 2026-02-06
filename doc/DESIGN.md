@@ -249,7 +249,7 @@ typedef struct SyncBatch {
 
 ### 5.3 Background Worker
 
-The worker is started on-demand via `duckpipe.start_worker()` and registers as a dynamic background worker with `bgw_restart_time = 10` (auto-restart on crash).
+The worker is started automatically by `add_table()` if no worker is already running for the current database. It can also be started manually via `start_worker()`. Both paths register a dynamic background worker with `bgw_restart_time = 10` (auto-restart on crash).
 
 ```c
 void duckpipe_worker_main(Datum main_arg) {
@@ -680,9 +680,6 @@ Data structures from `src/include/replication/logicalproto.h`:
 ```sql
 CREATE EXTENSION pg_duckpipe CASCADE;  -- installs pg_duckdb dependency
 
--- Start the CDC worker
-SELECT duckpipe.start_worker();
-
 -- Create source table
 CREATE TABLE orders (id SERIAL PRIMARY KEY, customer_id INT, amount NUMERIC);
 
@@ -690,6 +687,7 @@ CREATE TABLE orders (id SERIAL PRIMARY KEY, customer_id INT, amount NUMERIC);
 CREATE TABLE ducklake.orders (id INT, customer_id INT, amount NUMERIC) USING ducklake;
 
 -- Add to sync (initial snapshot + streaming)
+-- The background worker starts automatically if not already running
 SELECT duckpipe.add_table('public.orders', 'ducklake.orders', 'default', true);
 
 -- OLTP writes

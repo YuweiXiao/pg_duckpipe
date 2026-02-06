@@ -1,0 +1,84 @@
+-- Test auto-start: add_table() should start background worker automatically
+CREATE EXTENSION pg_duckpipe CASCADE;
+NOTICE:  installing required extension "pg_duckdb"
+-- Verify no worker is running yet
+SELECT count(*) AS workers_before FROM pg_stat_activity WHERE backend_type = 'pg_duckpipe';
+ workers_before 
+----------------
+              0
+(1 row)
+
+-- Create source and target tables
+CREATE TABLE auto_test (id int primary key, val text);
+CREATE TABLE ducklake.auto_test (id int, val text) USING ducklake;
+-- add_table should auto-start the worker (no start_worker() call)
+SELECT duckpipe.add_table('public.auto_test', 'ducklake.auto_test', 'default', false);
+ add_table 
+-----------
+ 
+(1 row)
+
+-- Give the worker time to register in pg_stat_activity
+SELECT pg_sleep(1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Verify worker is now running
+SELECT count(*) AS workers_after FROM pg_stat_activity WHERE backend_type = 'pg_duckpipe';
+ workers_after 
+---------------
+             1
+(1 row)
+
+-- Verify start_worker() reports already running
+SELECT duckpipe.start_worker();
+NOTICE:  Worker already running for database regression
+ start_worker 
+--------------
+ 
+(1 row)
+
+-- Adding a second table should NOT start another worker
+CREATE TABLE auto_test2 (id int primary key, val text);
+CREATE TABLE ducklake.auto_test2 (id int, val text) USING ducklake;
+SELECT duckpipe.add_table('public.auto_test2', 'ducklake.auto_test2', 'default', false);
+ add_table 
+-----------
+ 
+(1 row)
+
+-- Still exactly one worker
+SELECT count(*) AS workers_still_one FROM pg_stat_activity WHERE backend_type = 'pg_duckpipe';
+ workers_still_one 
+-------------------
+                 1
+(1 row)
+
+-- Cleanup
+SELECT duckpipe.remove_table('public.auto_test', false);
+ remove_table 
+--------------
+ 
+(1 row)
+
+SELECT duckpipe.remove_table('public.auto_test2', false);
+ remove_table 
+--------------
+ 
+(1 row)
+
+DROP TABLE ducklake.auto_test;
+DROP TABLE ducklake.auto_test2;
+DROP TABLE auto_test;
+DROP TABLE auto_test2;
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
+ stop_worker 
+-------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DROP EXTENSION pg_duckpipe CASCADE;
