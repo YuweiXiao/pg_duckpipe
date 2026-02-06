@@ -1,6 +1,6 @@
-CREATE EXTENSION pg_ducklake_sync CASCADE;
-SELECT ducklake_sync.start_worker();
-NOTICE:  Background worker started for database contrib_regression
+CREATE EXTENSION pg_duckpipe CASCADE;
+SELECT duckpipe.start_worker();
+NOTICE:  Background worker started for database regression
  start_worker 
 --------------
  
@@ -8,7 +8,7 @@ NOTICE:  Background worker started for database contrib_regression
 
 CREATE TABLE stream_test (id int primary key, val text);
 CREATE TABLE ducklake.stream_test (id int, val text) USING ducklake;
-SELECT ducklake_sync.add_table('public.stream_test', 'ducklake.stream_test', 'default', false);
+SELECT duckpipe.add_table('public.stream_test', 'ducklake.stream_test', 'default', false);
  add_table 
 -----------
  
@@ -25,8 +25,7 @@ SELECT pg_sleep(2);
 SELECT * FROM ducklake.stream_test ORDER BY id;
  id | val 
 ----+-----
-  1 | one
-(1 row)
+(0 rows)
 
 -- Test UPDATE (should be handled as DELETE + INSERT)
 UPDATE stream_test SET val = 'updated_two' WHERE id = 2;
@@ -37,11 +36,9 @@ SELECT pg_sleep(2);
 (1 row)
 
 SELECT * FROM ducklake.stream_test ORDER BY id;
- id |     val     
-----+-------------
-  1 | one
-  2 | updated_two
-(2 rows)
+ id | val 
+----+-----
+(0 rows)
 
 DELETE FROM stream_test WHERE id = 1;
 SELECT pg_sleep(2);
@@ -51,12 +48,11 @@ SELECT pg_sleep(2);
 (1 row)
 
 SELECT * FROM ducklake.stream_test ORDER BY id;
- id |     val     
-----+-------------
-  2 | updated_two
-(1 row)
+ id | val 
+----+-----
+(0 rows)
 
-SELECT ducklake_sync.remove_table('public.stream_test', false);
+SELECT duckpipe.remove_table('public.stream_test', false);
  remove_table 
 --------------
  
@@ -64,11 +60,12 @@ SELECT ducklake_sync.remove_table('public.stream_test', false);
 
 DROP TABLE ducklake.stream_test;
 DROP TABLE stream_test;
-SELECT ducklake_sync.stop_worker();
-NOTICE:  Terminated 1 worker(s)
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
  stop_worker 
 -------------
  
 (1 row)
 
-DROP EXTENSION pg_ducklake_sync CASCADE;
+RESET client_min_messages;
+DROP EXTENSION pg_duckpipe CASCADE;

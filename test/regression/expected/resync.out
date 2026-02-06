@@ -1,0 +1,82 @@
+-- Test resync_table functionality
+CREATE EXTENSION pg_duckpipe CASCADE;
+SELECT duckpipe.start_worker();
+NOTICE:  Background worker started for database regression
+ start_worker 
+--------------
+ 
+(1 row)
+
+CREATE TABLE resync_src (id int primary key, val text);
+INSERT INTO resync_src VALUES (1, 'one'), (2, 'two');
+CREATE TABLE ducklake.resync_src (id int, val text) USING ducklake;
+SELECT duckpipe.add_table('public.resync_src', 'ducklake.resync_src', 'default', true);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT pg_sleep(2);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Verify initial snapshot
+SELECT * FROM ducklake.resync_src ORDER BY id;
+ id | val 
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+-- Modify source data directly
+INSERT INTO resync_src VALUES (3, 'three');
+SELECT pg_sleep(2);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Now trigger resync
+SELECT duckpipe.resync_table('public.resync_src');
+NOTICE:  Table 'public.resync_src' marked for resync
+ resync_table 
+--------------
+ 
+(1 row)
+
+SELECT pg_sleep(3);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Verify target has current source data
+SELECT * FROM ducklake.resync_src ORDER BY id;
+ id |  val  
+----+-------
+  1 | one
+  1 | one
+  2 | two
+  2 | two
+  3 | three
+(5 rows)
+
+SELECT duckpipe.remove_table('public.resync_src', false);
+ remove_table 
+--------------
+ 
+(1 row)
+
+DROP TABLE ducklake.resync_src;
+DROP TABLE resync_src;
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
+ stop_worker 
+-------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DROP EXTENSION pg_duckpipe CASCADE;

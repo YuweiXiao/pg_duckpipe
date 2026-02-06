@@ -1,0 +1,42 @@
+-- Test monitoring functions
+CREATE EXTENSION pg_duckpipe CASCADE;
+-- Test duckpipe.groups() returns default group info
+SELECT name, publication, slot_name, enabled, table_count FROM duckpipe.groups();
+  name   |       publication       |        slot_name         | enabled | table_count 
+---------+-------------------------+--------------------------+---------+-------------
+ default | duckpipe_pub_regression | duckpipe_slot_regression | t       |           0
+(1 row)
+
+-- Create and add table manually (explicit target table to avoid cross-tx DuckDB issue)
+CREATE TABLE mon_test (id int primary key, val text);
+CREATE TABLE ducklake.mon_test (id int, val text) USING ducklake;
+SELECT duckpipe.add_table('public.mon_test', 'ducklake.mon_test', 'default', false);
+ add_table 
+-----------
+ 
+(1 row)
+
+-- Test duckpipe.tables() returns the mapping
+SELECT source_table, target_table, sync_group, enabled FROM duckpipe.tables();
+  source_table   |   target_table    | sync_group | enabled 
+-----------------+-------------------+------------+---------
+ public.mon_test | ducklake.mon_test | default    | t
+(1 row)
+
+-- Test duckpipe.status() returns state info
+SELECT sync_group, source_table, target_table, state, enabled FROM duckpipe.status();
+ sync_group |  source_table   |   target_table    |   state   | enabled 
+------------+-----------------+-------------------+-----------+---------
+ default    | public.mon_test | ducklake.mon_test | STREAMING | t
+(1 row)
+
+-- Cleanup
+SELECT duckpipe.remove_table('public.mon_test', false);
+ remove_table 
+--------------
+ 
+(1 row)
+
+DROP TABLE ducklake.mon_test;
+DROP TABLE mon_test;
+DROP EXTENSION pg_duckpipe CASCADE;

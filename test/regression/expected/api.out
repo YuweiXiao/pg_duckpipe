@@ -1,0 +1,110 @@
+-- Test API functions and metadata management
+CREATE EXTENSION pg_duckpipe CASCADE;
+NOTICE:  installing required extension "pg_duckdb"
+-- Verify default group exists
+SELECT name, publication, slot_name FROM duckpipe.sync_groups;
+  name   |       publication       |        slot_name         
+---------+-------------------------+--------------------------
+ default | duckpipe_pub_regression | duckpipe_slot_regression
+(1 row)
+
+-- Test create_group (STRICT bug fixed - should now succeed)
+SELECT duckpipe.create_group('analytics');
+ create_group 
+--------------
+ analytics
+(1 row)
+
+SELECT name, publication, slot_name FROM duckpipe.sync_groups WHERE name = 'analytics';
+   name    |      publication       |        slot_name        
+-----------+------------------------+-------------------------
+ analytics | duckpipe_pub_analytics | duckpipe_slot_analytics
+(1 row)
+
+-- Test add_table to the new group
+CREATE TABLE t1 (id int primary key, val text);
+SELECT duckpipe.add_table('public.t1', 'ducklake.t1', 'analytics', false);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT source_schema, source_table, group_id, state
+FROM duckpipe.table_mappings
+WHERE source_table = 't1';
+ source_schema | source_table | group_id |   state   
+---------------+--------------+----------+-----------
+ public        | t1           |        2 | STREAMING
+(1 row)
+
+-- Test move_table
+SELECT duckpipe.move_table('public.t1', 'default');
+ move_table 
+------------
+ 
+(1 row)
+
+SELECT m.source_schema, m.source_table, g.name as group_name
+FROM duckpipe.table_mappings m
+JOIN duckpipe.sync_groups g ON m.group_id = g.id
+WHERE m.source_table = 't1';
+ source_schema | source_table | group_name 
+---------------+--------------+------------
+ public        | t1           | default
+(1 row)
+
+-- Test remove_table
+SELECT duckpipe.remove_table('public.t1', false);
+ remove_table 
+--------------
+ 
+(1 row)
+
+SELECT count(*) FROM duckpipe.table_mappings WHERE source_table = 't1';
+ count 
+-------
+     0
+(1 row)
+
+-- Test enable/disable group
+SELECT duckpipe.disable_group('analytics');
+NOTICE:  Sync group 'analytics' disabled
+ disable_group 
+---------------
+ 
+(1 row)
+
+SELECT enabled FROM duckpipe.sync_groups WHERE name = 'analytics';
+ enabled 
+---------
+ f
+(1 row)
+
+SELECT duckpipe.enable_group('analytics');
+NOTICE:  Sync group 'analytics' enabled
+ enable_group 
+--------------
+ 
+(1 row)
+
+SELECT enabled FROM duckpipe.sync_groups WHERE name = 'analytics';
+ enabled 
+---------
+ t
+(1 row)
+
+-- Test drop_group cleans up
+SELECT duckpipe.drop_group('analytics');
+ drop_group 
+------------
+ 
+(1 row)
+
+SELECT count(*) FROM duckpipe.sync_groups WHERE name = 'analytics';
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE t1;
+DROP EXTENSION pg_duckpipe CASCADE;
