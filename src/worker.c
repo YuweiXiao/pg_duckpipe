@@ -13,8 +13,8 @@
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
-/* Memory context for sync operations */
-static MemoryContext SyncMemoryContext = NULL;
+/* Memory context for sync operations - non-static so other files can use it */
+MemoryContext SyncMemoryContext = NULL;
 
 static void
 duckpipe_sighup(SIGNAL_ARGS) {
@@ -253,6 +253,8 @@ process_sync_group(SyncGroup *group) {
 	HTAB *batches;
 	HTAB *rel_cache;
 	StringInfoData query;
+	WalMessage *wal_messages = NULL;
+	uint64 num_messages = 0;
 
 	/* Handle snapshots first */
 	process_snapshot(group);
@@ -295,42 +297,70 @@ process_sync_group(SyncGroup *group) {
 		return 0;
 	}
 
-	/* Process each change message */
-	{
-		uint64 num_changes = SPI_processed;
-		SPITupleTable *changes_tuptable = SPI_tuptable;
+	/* Pre-copy all WAL messages into SyncMemoryContext so they survive SPI_commit */
+	num_messages = SPI_processed;
+	if (num_messages > 0) {
+		MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+		wal_messages = palloc(sizeof(WalMessage) * num_messages);
 
-		for (uint64 i = 0; i < num_changes; i++) {
+		for (uint64 i = 0; i < num_messages; i++) {
 			bool isnull;
-			XLogRecPtr lsn;
-			Datum lsn_datum = SPI_getbinval(changes_tuptable->vals[i], changes_tuptable->tupdesc, 1, &isnull);
-			Datum data_datum = SPI_getbinval(changes_tuptable->vals[i], changes_tuptable->tupdesc, 2, &isnull);
+			Datum lsn_datum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+			Datum data_datum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
 
-			if (isnull)
+			if (isnull) {
+				wal_messages[i].data = NULL;
+				wal_messages[i].len = 0;
+				wal_messages[i].lsn = InvalidXLogRecPtr;
 				continue;
+			}
 
-			lsn = DatumGetLSN(lsn_datum);
+			wal_messages[i].lsn = DatumGetLSN(lsn_datum);
 			{
 				bytea *data = DatumGetByteaP(data_datum);
 				int len = VARSIZE(data) - VARHDRSZ;
 				char *raw = VARDATA(data);
 
-				/* Create StringInfo for parsing */
-				StringInfoData buf;
-				initStringInfo(&buf);
-				appendBinaryStringInfo(&buf, raw, len);
-
-				/* Decode and process the message */
-				decode_message(&buf, lsn, group, batches, rel_cache);
-
-				pfree(buf.data);
-				total_processed++;
+				wal_messages[i].data = palloc(len);
+				memcpy(wal_messages[i].data, raw, len);
+				wal_messages[i].len = len;
 			}
 		}
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	/* Process each pre-copied WAL message */
+	for (uint64 i = 0; i < num_messages; i++) {
+		StringInfoData buf;
+
+		if (wal_messages[i].data == NULL)
+			continue;
+
+		/* Create StringInfo for parsing */
+		initStringInfo(&buf);
+		appendBinaryStringInfo(&buf, wal_messages[i].data, wal_messages[i].len);
+
+		/* Decode and process the message */
+		if (decode_message(&buf, wal_messages[i].lsn, group, batches, rel_cache)) {
+			/* COMMIT boundary reached - split transaction to release locks */
+			PopActiveSnapshot();
+			SPI_commit();
+			SPI_start_transaction();
+			PushActiveSnapshot(GetTransactionSnapshot());
+		}
+
+		pfree(buf.data);
+		total_processed++;
 	}
 
 	/* Flush any remaining batches */
 	flush_all_batches(batches);
+
+	/* Commit data changes before metadata updates */
+	PopActiveSnapshot();
+	SPI_commit();
+	SPI_start_transaction();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/* Transition any CATCHUP tables to STREAMING.
 	 * After consuming a round of WAL, any table still in CATCHUP has now
@@ -423,18 +453,28 @@ duckpipe_worker_main(Datum main_arg) {
 			MemoryContextSwitchTo(old);
 		}
 
-		foreach (lc, groups) {
-			SyncGroup *group = (SyncGroup *)lfirst(lc);
-			int processed = process_sync_group(group);
-			if (processed > 0)
-				any_work = true;
+		PG_TRY();
+		{
+			foreach (lc, groups) {
+				SyncGroup *group = (SyncGroup *)lfirst(lc);
+				int processed = process_sync_group(group);
+				if (processed > 0)
+					any_work = true;
+			}
+
+			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
 		}
+		PG_CATCH();
+		{
+			EmitErrorReport();
+			FlushErrorState();
+			AbortCurrentTransaction();
+		}
+		PG_END_TRY();
 
-		SPI_finish();
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-
-		/* Reset memory context after each round */
+		/* Reset memory context after each round (both success and error paths) */
 		MemoryContextReset(SyncMemoryContext);
 
 		/* Wait before next poll (shorter if there was work) */

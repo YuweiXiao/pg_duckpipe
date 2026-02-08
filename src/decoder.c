@@ -2,10 +2,12 @@
 
 #include "executor/spi.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 
 /*
  * Helper to convert LogicalRepTupleData to a List of string values.
  * We deep copy the strings because the buffer is transient.
+ * Allocates in SyncMemoryContext so data survives SPI commits.
  *
  * LogicalRepTupleData structure (this PostgreSQL version):
  *   StringInfoData *colvalues; -- array of StringInfoData, one per column
@@ -16,6 +18,7 @@ static List *
 tuple_to_list(LogicalRepTupleData *tuple, LogicalRepRelation *rel) {
 	List *values = NIL;
 	int i;
+	MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
 
 	for (i = 0; i < tuple->ncols; i++) {
 		char status = tuple->colstatus[i];
@@ -42,10 +45,79 @@ tuple_to_list(LogicalRepTupleData *tuple, LogicalRepRelation *rel) {
 		values = lappend(values, val_str);
 	}
 
+	MemoryContextSwitchTo(oldcxt);
 	return values;
 }
 
-void
+/*
+ * Extract only the primary key column values from a tuple.
+ * Used for UPDATE when !has_old: newtup contains all columns but
+ * key_values should only contain the PK columns in order.
+ * Allocates in SyncMemoryContext so data survives SPI commits.
+ */
+static List *
+extract_key_values(LogicalRepTupleData *tuple, LogicalRepRelation *rel) {
+	List *values = NIL;
+	int x = -1;
+	MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+
+	if (rel->attkeys == NULL) {
+		/* No key info - fall back to full tuple */
+		MemoryContextSwitchTo(oldcxt);
+		return tuple_to_list(tuple, rel);
+	}
+
+	while ((x = bms_next_member(rel->attkeys, x)) >= 0) {
+		if (x < tuple->ncols) {
+			char status = tuple->colstatus[x];
+			char *val_str = NULL;
+
+			if (status == 'n' || status == 'u') {
+				val_str = NULL;
+			} else {
+				int len = tuple->colvalues[x].len;
+				char *data = tuple->colvalues[x].data;
+
+				val_str = palloc(len + 1);
+				memcpy(val_str, data, len);
+				val_str[len] = '\0';
+			}
+
+			values = lappend(values, val_str);
+		}
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	return values;
+}
+
+/*
+ * Free a deep-copied LogicalRepRelation and its contents.
+ */
+static void
+free_logical_rep_relation(LogicalRepRelation *rel) {
+	if (rel == NULL)
+		return;
+
+	if (rel->nspname)
+		pfree(rel->nspname);
+	if (rel->relname)
+		pfree(rel->relname);
+	if (rel->attnames) {
+		for (int i = 0; i < rel->natts; i++) {
+			if (rel->attnames[i])
+				pfree(rel->attnames[i]);
+		}
+		pfree(rel->attnames);
+	}
+	if (rel->atttyps)
+		pfree(rel->atttyps);
+	if (rel->attkeys)
+		bms_free(rel->attkeys);
+	pfree(rel);
+}
+
+bool
 decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, HTAB *rel_cache) {
 	char msgtype = pq_getmsgbyte(buf);
 
@@ -56,7 +128,10 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 		bool found;
 
 		entry = (RelationCacheEntry *)hash_search(rel_cache, &rel->remoteid, HASH_ENTER, &found);
-		/* If found, we might want to free old one? */
+		if (found && entry->rel != NULL) {
+			/* Free old relation data to prevent memory leak */
+			free_logical_rep_relation(entry->rel);
+		}
 		entry->rel = rel;      /* Store the new relation definition */
 		entry->mapping = NULL; /* Reset cached mapping on schema change */
 		break;
@@ -73,25 +148,29 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 		/* Find Relation info */
 		entry = (RelationCacheEntry *)hash_search(rel_cache, &relid, HASH_FIND, NULL);
 		if (!entry)
-			return; /* Should not happen if protocol flow is correct */
+			return false; /* Should not happen if protocol flow is correct */
 
 		/* Find Table Mapping (cached per relation per poll round) */
 		if (entry->mapping == NULL)
 			entry->mapping = get_table_mapping(group, entry->rel->nspname, entry->rel->relname);
 		mapping = entry->mapping;
 		if (!mapping || !mapping->enabled)
-			return;
+			return false;
 
 		/* During CATCHUP, skip changes already included in snapshot */
 		if (mapping->state == SYNC_STATE_CATCHUP && mapping->snapshot_lsn != InvalidXLogRecPtr &&
 		    lsn <= mapping->snapshot_lsn)
-			return;
+			return false;
 
-		/* Construct Change */
-		change = palloc(sizeof(SyncChange));
-		change->type = SYNC_CHANGE_INSERT;
-		change->lsn = lsn;
-		change->key_values = NIL;
+		/* Construct Change in SyncMemoryContext */
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+			change = palloc(sizeof(SyncChange));
+			change->type = SYNC_CHANGE_INSERT;
+			change->lsn = lsn;
+			change->key_values = NIL;
+			MemoryContextSwitchTo(oldcxt);
+		}
 		change->col_values = tuple_to_list(&newtup, entry->rel);
 
 		batch_add_change(batches, mapping, change, entry->rel);
@@ -109,42 +188,48 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 
 		entry = (RelationCacheEntry *)hash_search(rel_cache, &relid, HASH_FIND, NULL);
 		if (!entry)
-			return;
+			return false;
 		if (entry->mapping == NULL)
 			entry->mapping = get_table_mapping(group, entry->rel->nspname, entry->rel->relname);
 		mapping = entry->mapping;
 		if (!mapping || !mapping->enabled)
-			return;
+			return false;
 
 		/* During CATCHUP, skip changes already included in snapshot */
 		if (mapping->state == SYNC_STATE_CATCHUP && mapping->snapshot_lsn != InvalidXLogRecPtr &&
 		    lsn <= mapping->snapshot_lsn)
-			return;
+			return false;
 
 		/* Treat UPDATE as DELETE + INSERT for simplicity in V1 (easy for column
 		 * store) */
 		/* Always generate DELETE first.
 		   If has_old is true, use oldtup for key.
-		   If has_old is false, it means key didn't change (or REPLICA IDENTITY
-		   DEFAULT), so use newtup for key.
+		   If has_old is false, extract only PK columns from newtup.
 		*/
 		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
 			SyncChange *del_change = palloc(sizeof(SyncChange));
 			del_change->type = SYNC_CHANGE_DELETE;
 			del_change->lsn = lsn;
 			del_change->col_values = NIL; /* Explicitly initialize */
+			MemoryContextSwitchTo(oldcxt);
+
 			if (has_old)
 				del_change->key_values = tuple_to_list(&oldtup, entry->rel);
 			else
-				del_change->key_values = tuple_to_list(&newtup, entry->rel);
+				del_change->key_values = extract_key_values(&newtup, entry->rel);
 
 			batch_add_change(batches, mapping, del_change, entry->rel);
 		}
 
-		change = palloc(sizeof(SyncChange));
-		change->type = SYNC_CHANGE_INSERT;
-		change->lsn = lsn;
-		change->key_values = NIL; /* Explicitly initialize */
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+			change = palloc(sizeof(SyncChange));
+			change->type = SYNC_CHANGE_INSERT;
+			change->lsn = lsn;
+			change->key_values = NIL; /* Explicitly initialize */
+			MemoryContextSwitchTo(oldcxt);
+		}
 		change->col_values = tuple_to_list(&newtup, entry->rel);
 		batch_add_change(batches, mapping, change, entry->rel);
 		break;
@@ -160,22 +245,26 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 
 		entry = (RelationCacheEntry *)hash_search(rel_cache, &relid, HASH_FIND, NULL);
 		if (!entry)
-			return;
+			return false;
 		if (entry->mapping == NULL)
 			entry->mapping = get_table_mapping(group, entry->rel->nspname, entry->rel->relname);
 		mapping = entry->mapping;
 		if (!mapping || !mapping->enabled)
-			return;
+			return false;
 
 		/* During CATCHUP, skip changes already included in snapshot */
 		if (mapping->state == SYNC_STATE_CATCHUP && mapping->snapshot_lsn != InvalidXLogRecPtr &&
 		    lsn <= mapping->snapshot_lsn)
-			return;
+			return false;
 
-		change = palloc(sizeof(SyncChange));
-		change->type = SYNC_CHANGE_DELETE;
-		change->lsn = lsn;
-		change->col_values = NIL; /* Explicitly initialize */
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+			change = palloc(sizeof(SyncChange));
+			change->type = SYNC_CHANGE_DELETE;
+			change->lsn = lsn;
+			change->col_values = NIL; /* Explicitly initialize */
+			MemoryContextSwitchTo(oldcxt);
+		}
 		change->key_values = tuple_to_list(&oldtup, entry->rel);
 		batch_add_change(batches, mapping, change, entry->rel);
 		break;
@@ -190,7 +279,7 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 		logicalrep_read_commit(buf, &commit_data);
 		group->pending_lsn = commit_data.end_lsn;
 		flush_all_batches(batches);
-		break;
+		return true; /* Signal caller that a commit boundary was reached */
 	}
 	case LOGICAL_REP_MSG_TRUNCATE: {
 		/*
@@ -241,4 +330,6 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 		elog(DEBUG1, "pg_duckpipe: unknown message type %c", msgtype);
 		break;
 	}
+
+	return false;
 }

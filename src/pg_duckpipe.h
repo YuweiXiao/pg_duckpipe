@@ -116,12 +116,22 @@ typedef struct SyncBatch {
 	int *keyattrs;  /* Array of key attribute indices (0-based) */
 } SyncBatch;
 
+/* Memory context for sync operations - survives SPI_commit */
+extern MemoryContext SyncMemoryContext;
+
+/* Pre-copied WAL message that survives SPI_commit */
+typedef struct WalMessage {
+	XLogRecPtr lsn;
+	char *data;
+	int len;
+} WalMessage;
+
 /* Worker functions */
 extern PGDLLEXPORT void duckpipe_worker_main(Datum main_arg);
 extern int process_sync_group(SyncGroup *group);
 
-/* Decoder functions */
-extern void decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, HTAB *rel_cache);
+/* Decoder functions - returns true when COMMIT message processed (batches flushed) */
+extern bool decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, HTAB *rel_cache);
 
 /* Batch functions */
 extern void batch_add_change(HTAB *batches, TableMapping *mapping, SyncChange *change, LogicalRepRelation *rel);

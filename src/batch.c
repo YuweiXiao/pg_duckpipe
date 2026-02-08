@@ -64,6 +64,8 @@ batch_add_change(HTAB *batches, TableMapping *mapping, SyncChange *change, Logic
 	batch = (SyncBatch *)hash_search(batches, key, HASH_ENTER, &found);
 
 	if (!found) {
+		MemoryContext oldcxt;
+
 		/* New batch - key is already copied into batch->target_table by hash_search
 		 * since it's the first field and keysize matches */
 		batch->changes = NIL;
@@ -73,7 +75,10 @@ batch_add_change(HTAB *batches, TableMapping *mapping, SyncChange *change, Logic
 		batch->nkeyattrs = 0;
 		batch->keyattrs = NULL;
 
-		/* Copy column names from relation */
+		/* Copy column names and key attrs in SyncMemoryContext so they
+		 * survive SPI_commit during transaction splitting */
+		oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+
 		if (rel != NULL) {
 			for (int i = 0; i < rel->natts; i++) {
 				batch->attnames = lappend(batch->attnames, pstrdup(rel->attnames[i]));
@@ -89,18 +94,21 @@ batch_add_change(HTAB *batches, TableMapping *mapping, SyncChange *change, Logic
 					batch->keyattrs = palloc(sizeof(int) * nkeys);
 					batch->nkeyattrs = 0;
 					while ((x = bms_next_member(rel->attkeys, x)) >= 0) {
-						/* attkeys seems to use 0-based attribute numbers in PG 18 or
-						 * LogicalRepRelation? */
-						/* If x=0 (first col), we want index 0. So no subtraction. */
 						batch->keyattrs[batch->nkeyattrs++] = x;
 					}
 				}
 			}
 		}
+
+		MemoryContextSwitchTo(oldcxt);
 	}
 
-	/* Add change */
-	batch->changes = lappend(batch->changes, change);
+	/* Add change in SyncMemoryContext so it survives SPI_commit */
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
+		batch->changes = lappend(batch->changes, change);
+		MemoryContextSwitchTo(oldcxt);
+	}
 	batch->count++;
 	batch->last_lsn = change->lsn;
 
