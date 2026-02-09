@@ -1,5 +1,4 @@
 -- Test TRUNCATE propagation
-CREATE EXTENSION pg_duckpipe CASCADE;
 SELECT duckpipe.start_worker();
 NOTICE:  Background worker started for database regression
  start_worker 
@@ -60,4 +59,3 @@ SELECT duckpipe.stop_worker();
 (1 row)
 
 RESET client_min_messages;
-DROP EXTENSION pg_duckpipe CASCADE;

@@ -1,5 +1,4 @@
 -- Test snapshot copy (initial load) and UPDATE sync
-CREATE EXTENSION pg_duckpipe CASCADE;
 SELECT duckpipe.start_worker();
 
 CREATE TABLE existing_data (id int primary key, val text);
@@ -24,4 +23,3 @@ DROP TABLE existing_data;
 SET client_min_messages = warning;
 SELECT duckpipe.stop_worker();
 RESET client_min_messages;
-DROP EXTENSION pg_duckpipe CASCADE;

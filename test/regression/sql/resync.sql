@@ -1,5 +1,4 @@
 -- Test resync_table functionality
-CREATE EXTENSION pg_duckpipe CASCADE;
 SELECT duckpipe.start_worker();
 
 CREATE TABLE resync_src (id int primary key, val text);
@@ -32,4 +31,3 @@ DROP TABLE resync_src;
 SET client_min_messages = warning;
 SELECT duckpipe.stop_worker();
 RESET client_min_messages;
-DROP EXTENSION pg_duckpipe CASCADE;

@@ -1,5 +1,4 @@
 -- Test monitoring functions
-CREATE EXTENSION pg_duckpipe CASCADE;
 
 -- Test duckpipe.groups() returns default group info
 SELECT name, publication, slot_name, enabled, table_count FROM duckpipe.groups();
@@ -20,4 +19,3 @@ SELECT duckpipe.remove_table('public.mon_test', false);
 DROP TABLE public.mon_test_ducklake;
 DROP TABLE mon_test;
 
-DROP EXTENSION pg_duckpipe CASCADE;

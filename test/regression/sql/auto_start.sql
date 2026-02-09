@@ -1,5 +1,4 @@
 -- Test auto-start: add_table() should start background worker automatically
-CREATE EXTENSION pg_duckpipe CASCADE;
 
 -- Verify no worker is running yet
 SELECT count(*) AS workers_before FROM pg_stat_activity WHERE backend_type = 'pg_duckpipe';
@@ -37,4 +36,3 @@ DROP TABLE auto_test2;
 SET client_min_messages = warning;
 SELECT duckpipe.stop_worker();
 RESET client_min_messages;
-DROP EXTENSION pg_duckpipe CASCADE;

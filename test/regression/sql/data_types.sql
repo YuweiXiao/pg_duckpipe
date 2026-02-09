@@ -1,5 +1,4 @@
 -- Test various PostgreSQL data types
-CREATE EXTENSION pg_duckpipe CASCADE;
 SELECT duckpipe.start_worker();
 
 CREATE TABLE dtype_test (
@@ -41,4 +40,3 @@ DROP TABLE dtype_test;
 SET client_min_messages = warning;
 SELECT duckpipe.stop_worker();
 RESET client_min_messages;
-DROP EXTENSION pg_duckpipe CASCADE;

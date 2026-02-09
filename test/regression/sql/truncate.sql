@@ -1,5 +1,4 @@
 -- Test TRUNCATE propagation
-CREATE EXTENSION pg_duckpipe CASCADE;
 SELECT duckpipe.start_worker();
 
 CREATE TABLE trunc_test (id int primary key, val text);
@@ -27,4 +26,3 @@ DROP TABLE trunc_test;
 SET client_min_messages = warning;
 SELECT duckpipe.stop_worker();
 RESET client_min_messages;
-DROP EXTENSION pg_duckpipe CASCADE;

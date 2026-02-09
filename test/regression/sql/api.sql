@@ -1,5 +1,4 @@
 -- Test API functions and metadata management
-CREATE EXTENSION pg_duckpipe CASCADE;
 
 -- Verify default group exists
 SELECT name, publication, slot_name FROM duckpipe.sync_groups;
@@ -43,4 +42,3 @@ SELECT count(*) FROM duckpipe.sync_groups WHERE name = 'analytics';
 
 DROP TABLE public.t1_ducklake;
 DROP TABLE t1;
-DROP EXTENSION pg_duckpipe CASCADE;
