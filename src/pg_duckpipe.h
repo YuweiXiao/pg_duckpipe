@@ -131,7 +131,7 @@ typedef struct WalMessage {
 extern PGDLLEXPORT void duckpipe_worker_main(Datum main_arg);
 extern int process_sync_group(SyncGroup *group);
 
-/* Decoder functions - returns true when COMMIT message processed (batches flushed) */
+/* Decoder functions - returns true when COMMIT message processed */
 extern bool decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, HTAB *rel_cache);
 
 /* Batch functions */

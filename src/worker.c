@@ -341,10 +341,10 @@ process_sync_group(SyncGroup *group) {
 		appendBinaryStringInfo(&buf, wal_messages[i].data, wal_messages[i].len);
 
 		/* Decode and process the message.
-		 * On COMMIT boundaries, decode_message flushes batches (applies SQL)
-		 * but we do NOT SPI_commit here — all changes accumulate in a single
-		 * DuckDB transaction and commit once at end-of-round.  This avoids
-		 * creating one parquet file per source transaction.
+		 * decode_message records COMMIT LSN boundaries but does not flush
+		 * batches. We flush by size, before TRUNCATE, and once at end-of-round.
+		 * This keeps apply work in one DuckDB transaction and avoids creating
+		 * one parquet file per source transaction.
 		 *
 		 * Crash safety is unaffected: pg_logical_slot_get_binary_changes()
 		 * already advanced the replication slot non-transactionally when we
@@ -383,6 +383,12 @@ process_sync_group(SyncGroup *group) {
 		SPI_execute_with_args("UPDATE duckpipe.sync_groups SET confirmed_lsn = $1, "
 		                      "last_sync_at = now() WHERE id = $2",
 		                      2, argtypes, values, NULL, false, 0);
+
+		elog(DEBUG1,
+		     "DuckPipe: sync progress group=%s slot=%s processed_changes=%d fetched_messages=%llu "
+		     "confirmed_lsn=%X/%X",
+		     group->name ? group->name : "<unknown>", group->slot_name ? group->slot_name : "<unknown>",
+		     total_processed, (unsigned long long)num_messages, LSN_FORMAT_ARGS(group->pending_lsn));
 	}
 
 	/* Clean up hash tables */

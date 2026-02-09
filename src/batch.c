@@ -10,9 +10,10 @@
 
 /* Update per-table sync metrics after a successful batch apply. */
 static void
-update_table_metrics(int mapping_id, int64 delta_rows) {
+update_table_metrics(int mapping_id, const char *target_table, int64 delta_rows) {
 	Datum values[2];
 	Oid argtypes[2] = {INT8OID, INT4OID};
+	int ret;
 
 	if (delta_rows <= 0)
 		return;
@@ -20,11 +21,17 @@ update_table_metrics(int mapping_id, int64 delta_rows) {
 	values[0] = Int64GetDatum(delta_rows);
 	values[1] = Int32GetDatum(mapping_id);
 
-	SPI_execute_with_args("UPDATE duckpipe.table_mappings "
-	                      "SET rows_synced = rows_synced + $1, "
-	                      "    last_sync_at = now() "
-	                      "WHERE id = $2",
-	                      2, argtypes, values, NULL, false, 0);
+	ret = SPI_execute_with_args("UPDATE duckpipe.table_mappings "
+	                            "SET rows_synced = rows_synced + $1, "
+	                            "    last_sync_at = now() "
+	                            "WHERE id = $2",
+	                            2, argtypes, values, NULL, false, 0);
+	if (ret != SPI_OK_UPDATE)
+		elog(WARNING, "DuckPipe: failed to update sync metrics for %s (mapping_id=%d, ret=%d)",
+		     target_table ? target_table : "<unknown>", mapping_id, ret);
+	else
+		elog(DEBUG1, "DuckPipe: sync progress table=%s applied_rows=%lld mapping_id=%d",
+		     target_table ? target_table : "<unknown>", (long long)delta_rows, mapping_id);
 }
 
 /* Build batch attnames/keyattrs using source table catalogs when RELATION
@@ -193,7 +200,7 @@ batch_add_change(HTAB *batches, TableMapping *mapping, SyncChange *change, Logic
 	if (batch->count >= duckpipe_batch_size_per_table) {
 		int applied_count = batch->count;
 		apply_batch(batch);
-		update_table_metrics(batch->mapping_id, applied_count);
+		update_table_metrics(batch->mapping_id, batch->target_table, applied_count);
 
 		/* Reset batch - keep attnames/keyattrs but clear changes */
 		free_change_list(batch->changes);
@@ -216,7 +223,7 @@ flush_all_batches(HTAB *batches) {
 		if (batch->count > 0) {
 			int applied_count = batch->count;
 			apply_batch(batch);
-			update_table_metrics(batch->mapping_id, applied_count);
+			update_table_metrics(batch->mapping_id, batch->target_table, applied_count);
 
 			/* Reset batch */
 			free_change_list(batch->changes);

@@ -79,6 +79,8 @@ Update handling:
 - Regression SQL lives in `test/regression/sql/`.
 - Expected output lives in `test/regression/expected/`.
 - SQL and expected file names should match (`foo.sql` <-> `foo.out`).
+- Prefer `pg_regress` temp instances for test setup (`make check-regression` or `pg_regress --temp-instance`).
+- Do not create regression test instances manually with `initdb`/`pg_ctl` unless `pg_regress` cannot be used.
 - Prefer targeted test runs while iterating, then broader run before finishing.
 
 Typical targeted runs:
@@ -100,4 +102,3 @@ Typical targeted runs:
   - tests run (commands)
   - doc updates if SQL/API behavior changed
   - mention which regression cases cover the change
-

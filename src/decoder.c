@@ -278,7 +278,12 @@ decode_message(StringInfo buf, XLogRecPtr lsn, SyncGroup *group, HTAB *batches, 
 		LogicalRepCommitData commit_data;
 		logicalrep_read_commit(buf, &commit_data);
 		group->pending_lsn = commit_data.end_lsn;
-		flush_all_batches(batches);
+		/* Do not flush on every source COMMIT.
+		 * We batch across multiple source transactions and flush at:
+		 *  1) batch_size_per_table threshold
+		 *  2) TRUNCATE boundaries
+		 *  3) end-of-poll round in process_sync_group()
+		 * This avoids generating one tiny DuckLake file per source commit. */
 		return true; /* Signal caller that a commit boundary was reached */
 	}
 	case LOGICAL_REP_MSG_TRUNCATE: {
