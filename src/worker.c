@@ -340,14 +340,17 @@ process_sync_group(SyncGroup *group) {
 		initStringInfo(&buf);
 		appendBinaryStringInfo(&buf, wal_messages[i].data, wal_messages[i].len);
 
-		/* Decode and process the message */
-		if (decode_message(&buf, wal_messages[i].lsn, group, batches, rel_cache)) {
-			/* COMMIT boundary reached - split transaction to release locks */
-			PopActiveSnapshot();
-			SPI_commit();
-			SPI_start_transaction();
-			PushActiveSnapshot(GetTransactionSnapshot());
-		}
+		/* Decode and process the message.
+		 * On COMMIT boundaries, decode_message flushes batches (applies SQL)
+		 * but we do NOT SPI_commit here — all changes accumulate in a single
+		 * DuckDB transaction and commit once at end-of-round.  This avoids
+		 * creating one parquet file per source transaction.
+		 *
+		 * Crash safety is unaffected: pg_logical_slot_get_binary_changes()
+		 * already advanced the replication slot non-transactionally when we
+		 * fetched the messages above, so mid-loop commits never provided
+		 * additional durability guarantees. */
+		decode_message(&buf, wal_messages[i].lsn, group, batches, rel_cache);
 
 		pfree(buf.data);
 		total_processed++;
