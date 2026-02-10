@@ -8,6 +8,8 @@ int duckpipe_poll_interval = 1000;
 int duckpipe_batch_size_per_table = 1000;
 int duckpipe_batch_size_per_group = 10000;
 bool duckpipe_enabled = true;
+bool duckpipe_debug_log = false;
+int duckpipe_data_inlining_row_limit = 0;
 
 void
 _PG_init(void) {
@@ -22,4 +24,11 @@ _PG_init(void) {
 
 	DefineCustomBoolVariable("duckpipe.enabled", "Enable pg_duckpipe background worker", NULL, &duckpipe_enabled, true,
 	                         PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("duckpipe.debug_log", "Emit critical-path timing logs for pg_duckpipe", NULL,
+	                         &duckpipe_debug_log, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("duckpipe.data_inlining_row_limit",
+	                         "DuckLake data inlining row limit (0 = disabled)", NULL,
+	                         &duckpipe_data_inlining_row_limit, 0, 0, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 }

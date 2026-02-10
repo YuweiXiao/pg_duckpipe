@@ -335,6 +335,18 @@ duckpipe_add_table(PG_FUNCTION_ARGS) {
 		if (ret < 0)
 			elog(ERROR, "Failed to create target table %s.%s", t_schema, t_table);
 
+		/* Enable data inlining so small batches are stored inline in the
+		 * metadata catalog instead of creating tiny Parquet files.
+		 * Controlled by duckpipe.data_inlining_row_limit GUC (default 0 = disabled). */
+		if (duckpipe_data_inlining_row_limit > 0) {
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "CALL ducklake.set_option('data_inlining_row_limit', %d)",
+			                 duckpipe_data_inlining_row_limit);
+			ret = SPI_execute(buf.data, false, 0);
+			if (ret < 0)
+				elog(WARNING, "Failed to set data_inlining_row_limit");
+		}
+
 		/* 7. Insert table mapping */
 		{
 			Datum values[6];

@@ -27,6 +27,8 @@ extern int duckpipe_poll_interval;
 extern int duckpipe_batch_size_per_table;
 extern int duckpipe_batch_size_per_group;
 extern bool duckpipe_enabled;
+extern bool duckpipe_debug_log;
+extern int duckpipe_data_inlining_row_limit;
 
 /* Sync state machine: PENDING → SNAPSHOT → CATCHUP → STREAMING */
 typedef enum SyncState { SYNC_STATE_PENDING, SYNC_STATE_SNAPSHOT, SYNC_STATE_CATCHUP, SYNC_STATE_STREAMING } SyncState;
