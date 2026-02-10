@@ -34,6 +34,9 @@ listen_addresses = 'localhost'
 unix_socket_directories = '/tmp'
 log_min_messages = warning
 duckdb.unsafe_allow_mixed_transactions=on
+duckpipe.debug_log=on
+duckpipe.batch_size_per_table=10000
+duckpipe.data_inlining_row_limit=100000
 EOF
 
 # Start each benchmark run with a fresh log file to avoid mixing old failures.

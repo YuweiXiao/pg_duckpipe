@@ -63,6 +63,7 @@ Update handling:
 - `duckpipe.batch_size_per_table`
 - `duckpipe.batch_size_per_group`
 - `duckpipe.enabled`
+- `duckpipe.debug_log`
 
 ## Coding Conventions
 

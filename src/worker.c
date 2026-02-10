@@ -5,6 +5,7 @@
 #include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "libpq/pqformat.h"
+#include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/snapmgr.h"
@@ -15,6 +16,15 @@ static volatile sig_atomic_t got_sigterm = false;
 
 /* Memory context for sync operations - non-static so other files can use it */
 MemoryContext SyncMemoryContext = NULL;
+
+static double
+duckpipe_elapsed_ms(const instr_time *start) {
+	instr_time end = *start;
+
+	INSTR_TIME_SET_CURRENT(end);
+	INSTR_TIME_SUBTRACT(end, *start);
+	return INSTR_TIME_GET_MILLISEC(end);
+}
 
 static void
 duckpipe_sighup(SIGNAL_ARGS) {
@@ -148,6 +158,11 @@ process_snapshot(SyncGroup *group) {
 	uint64 i;
 	List *tasks = NIL;
 	MemoryContext oldcxt;
+	instr_time snapshot_timer;
+	bool timing_enabled = duckpipe_debug_log;
+
+	if (timing_enabled)
+		INSTR_TIME_SET_CURRENT(snapshot_timer);
 
 	ret = SPI_execute_with_args("SELECT id, source_schema, source_table, target_schema, target_table "
 	                            "FROM duckpipe.table_mappings "
@@ -185,6 +200,10 @@ process_snapshot(SyncGroup *group) {
 			SnapshotTask *task = (SnapshotTask *)lfirst(lc);
 			StringInfoData buf;
 			XLogRecPtr snapshot_lsn;
+			instr_time table_timer;
+
+			if (timing_enabled)
+				INSTR_TIME_SET_CURRENT(table_timer);
 
 			/* Clear target before snapshot copy. This avoids duplicates during
 			 * resync even when target TRUNCATE is not effective. */
@@ -241,7 +260,18 @@ process_snapshot(SyncGroup *group) {
 			SPI_commit();
 			SPI_start_transaction();
 			PushActiveSnapshot(GetTransactionSnapshot());
+
+			if (timing_enabled) {
+				elog(LOG, "DuckPipe timing: action=snapshot_table group=%s source=%s.%s target=%s.%s elapsed_ms=%.3f",
+				     group->name ? group->name : "<unknown>", task->s_schema, task->s_table, task->t_schema,
+				     task->t_table, duckpipe_elapsed_ms(&table_timer));
+			}
 		}
+	}
+
+	if (timing_enabled) {
+		elog(LOG, "DuckPipe timing: action=snapshot_round group=%s tables=%d elapsed_ms=%.3f",
+		     group->name ? group->name : "<unknown>", list_length(tasks), duckpipe_elapsed_ms(&snapshot_timer));
 	}
 }
 
@@ -255,6 +285,15 @@ process_sync_group(SyncGroup *group) {
 	StringInfoData query;
 	WalMessage *wal_messages = NULL;
 	uint64 num_messages = 0;
+	instr_time group_timer;
+	instr_time fetch_timer;
+	instr_time copy_timer;
+	instr_time decode_timer;
+	instr_time flush_timer;
+	bool timing_enabled = duckpipe_debug_log;
+
+	if (timing_enabled)
+		INSTR_TIME_SET_CURRENT(group_timer);
 
 	/* Handle snapshots first */
 	process_snapshot(group);
@@ -287,6 +326,8 @@ process_sync_group(SyncGroup *group) {
 	                 quote_literal_cstr(group->slot_name), duckpipe_batch_size_per_group,
 	                 quote_literal_cstr(group->publication));
 
+	if (timing_enabled)
+		INSTR_TIME_SET_CURRENT(fetch_timer);
 	ret = SPI_execute(query.data, true, 0);
 	pfree(query.data);
 
@@ -299,7 +340,15 @@ process_sync_group(SyncGroup *group) {
 
 	/* Pre-copy all WAL messages into SyncMemoryContext so they survive SPI_commit */
 	num_messages = SPI_processed;
+	if (timing_enabled) {
+		elog(LOG, "DuckPipe timing: action=fetch_wal group=%s slot=%s fetched_messages=%llu elapsed_ms=%.3f",
+		     group->name ? group->name : "<unknown>", group->slot_name ? group->slot_name : "<unknown>",
+		     (unsigned long long)num_messages, duckpipe_elapsed_ms(&fetch_timer));
+	}
+
 	if (num_messages > 0) {
+		if (timing_enabled)
+			INSTR_TIME_SET_CURRENT(copy_timer);
 		MemoryContext oldcxt = MemoryContextSwitchTo(SyncMemoryContext);
 		wal_messages = palloc(sizeof(WalMessage) * num_messages);
 
@@ -327,9 +376,19 @@ process_sync_group(SyncGroup *group) {
 			}
 		}
 		MemoryContextSwitchTo(oldcxt);
+
+		if (timing_enabled) {
+			elog(LOG, "DuckPipe timing: action=copy_wal_messages group=%s copied_messages=%llu elapsed_ms=%.3f",
+			     group->name ? group->name : "<unknown>", (unsigned long long)num_messages,
+			     duckpipe_elapsed_ms(&copy_timer));
+		}
 	}
 
-	/* Process each pre-copied WAL message */
+	/* Process each pre-copied WAL message.
+	 * Zero-copy: point StringInfo directly at the pre-copied buffer
+	 * instead of allocating and copying per message. */
+	if (timing_enabled)
+		INSTR_TIME_SET_CURRENT(decode_timer);
 	for (uint64 i = 0; i < num_messages; i++) {
 		StringInfoData buf;
 
@@ -345,9 +404,19 @@ process_sync_group(SyncGroup *group) {
 		decode_message(&buf, wal_messages[i].lsn, group, batches, rel_cache);
 		total_processed++;
 	}
+	if (timing_enabled) {
+		elog(LOG, "DuckPipe timing: action=decode_messages group=%s decoded_messages=%d elapsed_ms=%.3f",
+		     group->name ? group->name : "<unknown>", total_processed, duckpipe_elapsed_ms(&decode_timer));
+	}
 
 	/* Flush any remaining batches */
+	if (timing_enabled)
+		INSTR_TIME_SET_CURRENT(flush_timer);
 	flush_all_batches(batches);
+	if (timing_enabled) {
+		elog(LOG, "DuckPipe timing: action=flush_batches group=%s elapsed_ms=%.3f",
+		     group->name ? group->name : "<unknown>", duckpipe_elapsed_ms(&flush_timer));
+	}
 
 	/* Commit data changes before metadata updates */
 	PopActiveSnapshot();
@@ -384,6 +453,14 @@ process_sync_group(SyncGroup *group) {
 	/* Clean up hash tables */
 	hash_destroy(batches);
 	hash_destroy(rel_cache);
+
+	if (timing_enabled) {
+		elog(LOG,
+		     "DuckPipe timing: action=process_sync_group group=%s slot=%s processed_changes=%d fetched_messages=%llu "
+		     "elapsed_ms=%.3f",
+		     group->name ? group->name : "<unknown>", group->slot_name ? group->slot_name : "<unknown>",
+		     total_processed, (unsigned long long)num_messages, duckpipe_elapsed_ms(&group_timer));
+	}
 
 	return total_processed;
 }

@@ -519,6 +519,7 @@ duckpipe.poll_interval = 1000          -- ms between polls (100-3600000)
 duckpipe.batch_size_per_table = 1000   -- changes per table before flush
 duckpipe.batch_size_per_group = 10000  -- total changes per group per round
 duckpipe.enabled = on                  -- enable/disable worker processing
+duckpipe.debug_log = off               -- emit critical-path timing logs
 ```
 
 All GUC parameters are `PGC_SIGHUP` — changeable via `ALTER SYSTEM` or config reload without restart.

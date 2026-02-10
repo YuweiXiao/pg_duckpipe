@@ -1,7 +1,17 @@
 #include "pg_duckpipe.h"
 
 #include "executor/spi.h"
+#include "portability/instr_time.h"
 #include "utils/builtins.h"
+
+static double
+duckpipe_elapsed_ms(const instr_time *start) {
+	instr_time end = *start;
+
+	INSTR_TIME_SET_CURRENT(end);
+	INSTR_TIME_SUBTRACT(end, *start);
+	return INSTR_TIME_GET_MILLISEC(end);
+}
 
 /*
  * Quote literal value for SQL using PostgreSQL's quote_literal_cstr.
@@ -55,9 +65,20 @@ apply_batch(SyncBatch *batch) {
 	char *target_schema;
 	char *target_table;
 	char *quoted_target;
+	bool timing_enabled = duckpipe_debug_log;
+	instr_time apply_timer;
+	double sql_exec_ms = 0.0;
+	double sql_build_ms = 0.0;
+	int insert_exec_count = 0;
+	int delete_exec_count = 0;
+	int insert_row_count = 0;
+	instr_time build_timer;
 
 	if (!batch || batch->count == 0)
 		return;
+
+	if (timing_enabled)
+		INSTR_TIME_SET_CURRENT(apply_timer);
 
 	/* apply_batch is always called within an active SPI session from
 	 * process_sync_group, so we must not open a nested SPI connection here.
@@ -73,6 +94,9 @@ apply_batch(SyncBatch *batch) {
 		if (change->type == SYNC_CHANGE_INSERT) {
 			ListCell *vc;
 			bool first_col = true;
+
+			if (timing_enabled)
+				INSTR_TIME_SET_CURRENT(build_timer);
 
 			if (!insert_started) {
 				appendStringInfo(&insert_buf, "INSERT INTO %s VALUES ", quoted_target);
@@ -94,10 +118,21 @@ apply_batch(SyncBatch *batch) {
 				pfree(quoted);
 			}
 			appendStringInfoChar(&insert_buf, ')');
+			insert_row_count++;
+
+			if (timing_enabled)
+				sql_build_ms += duckpipe_elapsed_ms(&build_timer);
 		} else if (change->type == SYNC_CHANGE_DELETE) {
 			/* Flush inserts first if any */
 			if (insert_started) {
+				instr_time exec_timer;
+				if (timing_enabled)
+					INSTR_TIME_SET_CURRENT(exec_timer);
 				ret = SPI_execute(insert_buf.data, false, 0);
+				if (timing_enabled) {
+					sql_exec_ms += duckpipe_elapsed_ms(&exec_timer);
+					insert_exec_count++;
+				}
 				if (ret != SPI_OK_INSERT)
 					elog(ERROR, "Failed to execute INSERT batch for %s (ret=%d)", batch->target_table, ret);
 				resetStringInfo(&insert_buf);
@@ -113,6 +148,10 @@ apply_batch(SyncBatch *batch) {
 			{
 				StringInfoData del_buf;
 				bool skip_delete = false;
+
+				if (timing_enabled)
+					INSTR_TIME_SET_CURRENT(build_timer);
+
 				initStringInfo(&del_buf);
 				appendStringInfo(&del_buf, "DELETE FROM %s WHERE ", quoted_target);
 
@@ -176,8 +215,18 @@ apply_batch(SyncBatch *batch) {
 				}
 
 				/* Execute the DELETE unless we detected a bounds error */
+				if (timing_enabled)
+					sql_build_ms += duckpipe_elapsed_ms(&build_timer);
+
 				if (!skip_delete) {
+					instr_time exec_timer;
+					if (timing_enabled)
+						INSTR_TIME_SET_CURRENT(exec_timer);
 					ret = SPI_execute(del_buf.data, false, 0);
+					if (timing_enabled) {
+						sql_exec_ms += duckpipe_elapsed_ms(&exec_timer);
+						delete_exec_count++;
+					}
 					if (ret != SPI_OK_DELETE)
 						elog(WARNING, "Failed to execute DELETE for %s (ret=%d)", batch->target_table, ret);
 				}
@@ -189,7 +238,14 @@ apply_batch(SyncBatch *batch) {
 
 	/* Flush remaining inserts */
 	if (insert_started) {
+		instr_time exec_timer;
+		if (timing_enabled)
+			INSTR_TIME_SET_CURRENT(exec_timer);
 		ret = SPI_execute(insert_buf.data, false, 0);
+		if (timing_enabled) {
+			sql_exec_ms += duckpipe_elapsed_ms(&exec_timer);
+			insert_exec_count++;
+		}
 		if (ret != SPI_OK_INSERT)
 			elog(ERROR, "Failed to execute INSERT batch for %s (ret=%d)", batch->target_table, ret);
 	}
@@ -198,4 +254,12 @@ apply_batch(SyncBatch *batch) {
 	pfree(quoted_target);
 	pfree(target_schema);
 	pfree(target_table);
+
+	if (timing_enabled) {
+		elog(LOG,
+		     "DuckPipe timing: action=apply_batch table=%s changes=%d insert_rows=%d insert_stmts=%d "
+		     "delete_stmts=%d sql_build_ms=%.3f sql_exec_ms=%.3f elapsed_ms=%.3f",
+		     batch->target_table, batch->count, insert_row_count, insert_exec_count, delete_exec_count, sql_build_ms,
+		     sql_exec_ms, duckpipe_elapsed_ms(&apply_timer));
+	}
 }

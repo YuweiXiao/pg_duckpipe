@@ -110,6 +110,7 @@ SET duckpipe.poll_interval = 1000;          -- ms between polls
 SET duckpipe.batch_size_per_table = 1000;   -- fairness between tables
 SET duckpipe.batch_size_per_group = 10000;  -- fairness between groups
 SET duckpipe.enabled = on;                  -- enable/disable worker
+SET duckpipe.debug_log = off;               -- emit critical-path timing logs
 ```
 
 ## Requirements
@@ -135,6 +136,14 @@ make check-regression TEST=api  # Run a single test
 ## Documentation
 
 See [doc/DESIGN.md](doc/DESIGN.md) for technical architecture and design decisions.
+
+## Performance TODOs
+
+- [ ] **Batch DELETEs in `apply_batch`** (`apply.c`): DELETEs are executed one-at-a-time via SPI. For UPDATE-heavy workloads (DELETE+INSERT pairs), this means 2N SPI calls per batch instead of 2. Batch DELETEs into a single `DELETE FROM t WHERE (pk) IN (VALUES ...)` statement.
+- [x] **Zero-copy WAL decode** (`worker.c`): The decode loop allocates/copies a StringInfo per message. Point StringInfo directly at the pre-copied `wal_messages[i].data` buffer instead of alloc+copy+free per message.
+- [ ] **Defer `update_table_metrics` to end-of-round** (`batch.c`): Each batch flush does an SPI UPDATE to `table_mappings`. Accumulate deltas and write once at end-of-round to reduce mid-pipeline SPI calls.
+- [x] **Skip poll wait when there is work** (`worker.c`): The worker now loops immediately without sleeping when any group processed changes, instead of always waiting 10ms.
+- [ ] **Per-group workers** (`worker.c`, `api.c`): Currently one background worker processes all sync groups sequentially. Launch one worker per sync group so groups can fetch/decode/apply in parallel, preventing one slow group from blocking others.
 
 ## License
 
