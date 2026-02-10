@@ -336,23 +336,13 @@ process_sync_group(SyncGroup *group) {
 		if (wal_messages[i].data == NULL)
 			continue;
 
-		/* Create StringInfo for parsing */
-		initStringInfo(&buf);
-		appendBinaryStringInfo(&buf, wal_messages[i].data, wal_messages[i].len);
+		/* Point directly at pre-copied data - no alloc, no copy */
+		buf.data = wal_messages[i].data;
+		buf.len = wal_messages[i].len;
+		buf.maxlen = wal_messages[i].len;
+		buf.cursor = 0;
 
-		/* Decode and process the message.
-		 * decode_message records COMMIT LSN boundaries but does not flush
-		 * batches. We flush by size, before TRUNCATE, and once at end-of-round.
-		 * This keeps apply work in one DuckDB transaction and avoids creating
-		 * one parquet file per source transaction.
-		 *
-		 * Crash safety is unaffected: pg_logical_slot_get_binary_changes()
-		 * already advanced the replication slot non-transactionally when we
-		 * fetched the messages above, so mid-loop commits never provided
-		 * additional durability guarantees. */
 		decode_message(&buf, wal_messages[i].lsn, group, batches, rel_cache);
-
-		pfree(buf.data);
 		total_processed++;
 	}
 
@@ -486,10 +476,13 @@ duckpipe_worker_main(Datum main_arg) {
 		/* Reset memory context after each round (both success and error paths) */
 		MemoryContextReset(SyncMemoryContext);
 
-		/* Wait before next poll (shorter if there was work) */
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-		                any_work ? 10 : duckpipe_poll_interval, PG_WAIT_EXTENSION);
-		ResetLatch(MyLatch);
+		/* If there was work, loop immediately without sleeping -
+		 * there may be more WAL to consume. Only wait when idle. */
+		if (!any_work) {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, duckpipe_poll_interval,
+			                PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+		}
 	}
 
 	elog(LOG, "pg_duckpipe worker shutting down");
