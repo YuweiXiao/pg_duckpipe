@@ -11,3 +11,4 @@ test: multiple_tables
 test: data_types
 test: resync
 test: truncate
+test: stress_append
