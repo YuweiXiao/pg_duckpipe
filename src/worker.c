@@ -502,15 +502,18 @@ process_sync_group(SyncGroup *group) {
 	SPI_start_transaction();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	/* Transition any CATCHUP tables to STREAMING.
-	 * After consuming a round of WAL, any table still in CATCHUP has now
-	 * consumed past its snapshot_lsn and can move to normal streaming. */
-	{
-		Datum values[1] = {Int32GetDatum(group->id)};
-		Oid argtypes[1] = {INT4OID};
+	/* Transition CATCHUP tables to STREAMING only when we have consumed WAL
+	 * past their snapshot_lsn.  With batch_size_per_group limiting how many
+	 * WAL messages are fetched per round, an unconditional promotion would
+	 * cause tables that haven't finished catching up to process remaining
+	 * WAL messages without skip logic, creating duplicates. */
+	if (group->pending_lsn != 0) {
+		Datum values[2] = {Int32GetDatum(group->id), LSNGetDatum(group->pending_lsn)};
+		Oid argtypes[2] = {INT4OID, LSNOID};
 		SPI_execute_with_args("UPDATE duckpipe.table_mappings SET state = 'STREAMING' "
-		                      "WHERE group_id = $1 AND state = 'CATCHUP'",
-		                      1, argtypes, values, NULL, false, 0);
+		                      "WHERE group_id = $1 AND state = 'CATCHUP' "
+		                      "AND snapshot_lsn <= $2",
+		                      2, argtypes, values, NULL, false, 0);
 	}
 
 	/* Update confirmed_lsn and last_sync_at after successful processing */

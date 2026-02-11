@@ -55,9 +55,13 @@ Default naming: source `public.lineitem` → target `public.lineitem_ducklake` (
 
 ### Table State Machine
 
-When adding a new table with copy_data=true: SNAPSHOT (copy data, record WAL LSN) → CATCHUP (skip WAL changes ≤ snapshot_lsn) → STREAMING (normal operation)
+State is tracked **per table** (not per group). Each table in a group transitions independently.
+
+When adding a new table with copy_data=true: SNAPSHOT (copy data, record WAL LSN) → CATCHUP (skip WAL changes ≤ snapshot_lsn, apply changes > snapshot_lsn) → STREAMING (normal operation)
 
 When adding with copy_data=false: directly STREAMING
+
+**CATCHUP → STREAMING transition**: A CATCHUP table is promoted to STREAMING only when the group's WAL consumption has advanced past the table's `snapshot_lsn` (i.e., `snapshot_lsn <= pending_lsn`). This prevents premature promotion when `batch_size_per_group` limits cause partial WAL consumption across multiple poll rounds.
 
 ## GUC Parameters
 
@@ -85,6 +89,7 @@ Tests are in `test/regression/sql/` with expected output in `test/regression/exp
 - **data_types.sql**: Various PostgreSQL data types
 - **resync.sql**: resync_table() functionality
 - **truncate.sql**: TRUNCATE propagation
+- **premature_catchup.sql**: CATCHUP→STREAMING transition correctness under batch-limited WAL consumption
 
 ## PostgreSQL Internals Used
 

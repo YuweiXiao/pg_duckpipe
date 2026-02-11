@@ -129,7 +129,7 @@ make install
 ## Running Tests
 
 ```bash
-make installcheck               # Run all 12 regression tests
+make installcheck               # Run all 13 regression tests
 make check-regression TEST=api  # Run a single test
 ```
 
@@ -141,10 +141,8 @@ See [doc/DESIGN.md](doc/DESIGN.md) for technical architecture and design decisio
 
 Cross-check against sibling project `../etl` identified these improvement opportunities for `pg_duckpipe`:
 
-1. **CATCHUP handoff should be LSN-gated (correctness)**
-- Current behavior promotes all `CATCHUP` tables to `STREAMING` at end of each poll round, even when only a partial WAL window was consumed due to `duckpipe.batch_size_per_group`.
-- Risk: rows already copied by snapshot can be replayed from leftover WAL and inserted again.
-- **Proposed fix:** transition `CATCHUP -> STREAMING` only when slot consumption in the current round has advanced to/past each table's `snapshot_lsn` (or when no WAL remains in the round).
+1. **~~CATCHUP handoff should be LSN-gated (correctness)~~ — FIXED**
+- Promotion is now LSN-gated: `CATCHUP -> STREAMING` only when `snapshot_lsn <= pending_lsn`.
 
 2. **Per-table error lifecycle and retry policy**
 - ETL keeps explicit errored state and retry strategy (`manual`, `timed`, `none`) so one table can fail without stalling the entire pipeline.
@@ -174,11 +172,15 @@ Cross-check against sibling project `../etl` identified these improvement opport
 
 Regression test: `test/regression/sql/snapshot_race.sql` (confirms no data loss under concurrent writes).
 
-### 2. Premature CATCHUP → STREAMING Transition — `worker.c:430`
+### 2. ~~Premature CATCHUP → STREAMING Transition~~ — FIXED
 
-**Severity: High**
+**Severity: ~~High~~ FIXED**
 
-After each poll round, ALL `CATCHUP` tables are unconditionally transitioned to `STREAMING`. If the slot contains more messages than `batch_size_per_group`, only a partial batch is consumed per round. CATCHUP tables that haven't consumed past their `snapshot_lsn` will be promoted to STREAMING prematurely, causing duplicate rows from WAL messages that should have been skipped.
+**Fix:** CATCHUP → STREAMING promotion is now LSN-gated. A CATCHUP table is promoted only when `snapshot_lsn <= pending_lsn` (the group's WAL consumption has advanced past the table's snapshot point). If no WAL was consumed in the round (`pending_lsn == 0`), no promotion happens. During CATCHUP, changes with LSN > snapshot_lsn are still applied normally — only changes at or below snapshot_lsn are skipped.
+
+**Original problem (for historical context):** After each poll round, ALL CATCHUP tables were unconditionally transitioned to STREAMING. If the slot contained more messages than `batch_size_per_group`, only a partial batch was consumed per round. CATCHUP tables that hadn't consumed past their `snapshot_lsn` were promoted to STREAMING prematurely, causing duplicate rows from WAL messages that should have been skipped.
+
+Regression test: `test/regression/sql/premature_catchup.sql` (200 separate transactions with `batch_size_per_group=100`, confirms no duplicates).
 
 ### 3. Snapshot Copy Blocks All Streaming Tables — `worker.c:process_sync_group()`
 
