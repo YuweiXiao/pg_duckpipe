@@ -1,0 +1,65 @@
+-- Test single large transaction with many rows
+--
+-- A single transaction inserts 500 rows. All changes accumulate
+-- during WAL processing and flush once at the end of the cycle.
+-- Verifies that large batch flushes work correctly and all rows
+-- arrive at the target.
+
+ALTER SYSTEM SET duckpipe.poll_interval = 100;
+SELECT pg_reload_conf();
+
+SELECT duckpipe.start_worker();
+
+CREATE TABLE large_txn (id int primary key, val text, num int);
+SELECT duckpipe.add_table('public.large_txn', NULL, 'default', false);
+
+-- Single transaction with 500 rows
+BEGIN;
+INSERT INTO large_txn
+  SELECT g, 'row_' || g, g * 10
+  FROM generate_series(1, 500) g;
+COMMIT;
+
+SELECT pg_sleep(5);
+
+-- Verify all 500 rows arrived
+SELECT count(*) AS total_rows FROM public.large_txn_ducklake;
+
+-- Verify data integrity (spot check first, last, middle)
+SELECT id, val, num FROM public.large_txn_ducklake WHERE id IN (1, 250, 500) ORDER BY id;
+
+-- Now do a large UPDATE in a single transaction
+BEGIN;
+UPDATE large_txn SET val = 'updated_' || id, num = num + 1 WHERE id <= 200;
+COMMIT;
+
+SELECT pg_sleep(5);
+
+-- Verify updates applied
+SELECT count(*) AS updated_rows
+FROM public.large_txn_ducklake
+WHERE val LIKE 'updated_%';
+
+-- Verify unchanged rows are intact
+SELECT id, val, num FROM public.large_txn_ducklake WHERE id = 500;
+
+-- Large DELETE
+BEGIN;
+DELETE FROM large_txn WHERE id > 400;
+COMMIT;
+
+SELECT pg_sleep(3);
+
+SELECT count(*) AS remaining_rows FROM public.large_txn_ducklake;
+
+-- Cleanup
+SELECT duckpipe.remove_table('public.large_txn', false);
+DROP TABLE public.large_txn_ducklake;
+DROP TABLE large_txn;
+
+ALTER SYSTEM RESET duckpipe.poll_interval;
+SELECT pg_reload_conf();
+
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
+RESET client_min_messages;

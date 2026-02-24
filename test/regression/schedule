@@ -14,6 +14,18 @@ test: truncate
 test: stress_append
 # TOAST unchanged columns become NULL (bug confirmation test)
 test: toast_unchanged
+# Composite primary keys (multi-column PK UPDATE/DELETE)
+test: composite_pk
+# Large single transaction (mid-txn flush triggers)
+test: large_transaction
+# Concurrent parallel flush across 5 tables (std::thread::scope)
+test: concurrent_tables
+# Multiple independent sync groups
+test: multi_group
+# Error detection and recovery via resync
+test: error_recovery
+# Table rename with OID-based routing
+test: rename_table
 # Premature CATCHUP→STREAMING transition (many separate transactions)
 test: premature_catchup
 # Snapshot race condition proof (uses background psql session)

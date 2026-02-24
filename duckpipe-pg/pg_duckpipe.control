@@ -1,0 +1,7 @@
+comment = 'CDC synchronization from heap tables to DuckLake columnar tables'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_duckpipe'
+relocatable = false
+schema = 'duckpipe'
+requires = 'pg_duckdb'
+superuser = true

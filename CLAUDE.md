@@ -6,8 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 pg_duckpipe is a PostgreSQL extension that provides automatic CDC (Change Data Capture) synchronization from heap tables (row store) to pg_ducklake columnar tables (column store). It enables HTAP (Hybrid Transactional/Analytical Processing) within a single PostgreSQL instance.
 
-**Key design principle**: Reuse PostgreSQL's production `pgoutput` plugin and built-in `logicalrep_read_*` parsing functions rather than implementing custom decoding.
-
 ## Build Commands
 
 ```bash
@@ -17,35 +15,56 @@ make installcheck               # Build + install + run regression tests
 make check-regression           # Run regression tests only
 make check-regression TEST=api  # Run a single test
 make clean-regression           # Remove test artifacts
-make format                     # Format C code with clang-format
 ```
 
-Tests run on a temporary PostgreSQL instance (port 5555) with special config (wal_level=logical, shared_preload_libraries). Test infrastructure lives in `test/regression/` with its own Makefile.
+Tests run on a temporary PostgreSQL instance (port 5555) with special config (wal_level=logical, shared_preload_libraries). Test infrastructure lives in `test/regression/` with its own Makefile. 19 regression tests; see `test/regression/schedule` for the full list.
 
 ## Architecture
 
 ### Data Flow
 ```
-Heap Tables → WAL → Logical Decoding Slot (pgoutput) → Background Worker → DuckLake Tables
+Heap Tables → WAL → Logical Decoding Slot (pgoutput) → Sync Engine → DuckLake Tables
 ```
 
-### Source Files (src/)
+The sync engine runs as either a PostgreSQL background worker (Mode 1) or a standalone daemon (Mode 2).
 
-- **pg_duckpipe.h**: Header with SyncState enum, all data structures, function declarations
-- **pg_duckpipe.c**: Extension entry point (_PG_init), GUC parameter definitions
-- **worker.c**: Background worker main loop, snapshot processing, WAL consumption, checkpointing
-- **decoder.c**: Message dispatcher - calls PostgreSQL's `logicalrep_read_*` functions to parse binary pgoutput messages, handles CATCHUP skip logic, caches table mappings
-- **batch.c**: Accumulates changes per table into batches, proper memory cleanup of nested SyncChange lists
-- **apply.c**: Generates and executes SQL to apply batched changes to DuckLake tables (DELETE then INSERT for UPDATEs)
-- **api.c**: SQL function implementations (add_table, remove_table, create_group, start_worker, etc.) and SRF monitoring views (groups, tables, status)
+### Workspace Structure (Rust)
 
-### Key Data Structures (pg_duckpipe.h)
+```
+pg_duckpipe/
+├── Cargo.toml                  # Workspace root
+├── duckpipe-core/              # Shared sync engine library
+│   └── src/
+│       ├── types.rs            # Value enum, Change, SyncGroup, TableMapping, LSN helpers
+│       ├── decoder.rs          # pgoutput binary decoding via pgwire-replication
+│       ├── slot_consumer.rs    # START_REPLICATION streaming (Unix + TCP)
+│       ├── snapshot.rs         # Pure Rust snapshot (SQL-based slot + pg_export_snapshot)
+│       ├── service.rs          # Orchestrator: process groups, WAL consumption, flush
+│       ├── metadata.rs         # Read/write duckpipe.sync_groups, table_mappings
+│       ├── duckdb_flush.rs     # Per-table DuckDB flush workers (Appender → buffer → compact → apply)
+│       ├── flush_coordinator.rs # Decoupled producer-consumer coordinator with self-triggered flush threads
+│       ├── flush_worker.rs     # Metrics update, error state handling via PG connection
+│       ├── queue.rs            # Per-table TableQueue staging
+│       ├── state.rs            # Table state machine
+│       └── error.rs            # Error types
+├── duckpipe-pg/                # PostgreSQL extension (Mode 1: bgworker)
+│   └── src/
+│       ├── lib.rs              # pgrx entry, _PG_init, GUCs, bgworker registration
+│       ├── api.rs              # SQL API: add_table, remove_table, create_group, etc.
+│       └── worker.rs           # BGWorker main loop — calls duckpipe_core
+├── duckpipe-daemon/            # Standalone daemon (Mode 2: TCP)
+│   └── src/
+│       └── main.rs             # CLI entry (clap), tokio::main, same duckpipe_core logic
+└── test/regression/            # SQL regression tests
+```
 
-- **SyncState** (enum): SYNC_STATE_PENDING, SYNC_STATE_SNAPSHOT, SYNC_STATE_CATCHUP, SYNC_STATE_STREAMING
+### Key Data Structures (duckpipe-core/src/types.rs)
+
+- **Value**: Typed column value enum (Null, Bool, Int16, Int32, Int64, Float32, Float64, Text). Parsed from pgoutput text representation using RELATION message type OIDs. Unrecognized types fall back to Text, which DuckDB auto-casts.
+- **Change**: A single decoded WAL change (INSERT/UPDATE/DELETE with typed `Vec<Value>` column values)
+- **RelCacheEntry**: Cached schema info from pgoutput RELATION messages (column names, PK indices, type OIDs)
 - **SyncGroup**: Represents a publication + replication slot pair (multiple tables share one group)
-- **TableMapping**: Maps source table to target DuckLake table with SyncState and snapshot_lsn
-- **SyncBatch**: Accumulated changes for one target table (hash key: schema.table)
-- **RelationCacheEntry**: Caches schema info from RELATION messages + cached TableMapping pointer
+- **TableMapping**: Maps source table to target DuckLake table with state and snapshot_lsn
 
 ### Target Table Auto-Creation
 
@@ -69,11 +88,13 @@ All GUC parameters are `PGC_SIGHUP` — must be changed via `ALTER SYSTEM SET` +
 
 ```sql
 duckpipe.poll_interval              -- ms between polls (default 1000, min 100)
-duckpipe.batch_size_per_table       -- changes per table per flush (default 1000, min 1)
-duckpipe.batch_size_per_group       -- total changes per group per round (default 10000, min 100)
+duckpipe.batch_size_per_group       -- max WAL messages per group per sync cycle (default 100000, min 100)
 duckpipe.enabled                    -- enable/disable worker (default on)
 duckpipe.debug_log                  -- emit critical-path timing logs (default off)
 duckpipe.data_inlining_row_limit   -- max rows to inline in INSERT VALUES (default 0)
+duckpipe.flush_interval             -- ms for self-triggered flush interval (default 1000, min 100)
+duckpipe.flush_batch_threshold      -- queued changes that trigger immediate flush (default 10000, min 100)
+duckpipe.max_queued_changes         -- max total queued changes before backpressure (default 500000, min 1000)
 ```
 
 ## Worker Lifecycle
@@ -82,45 +103,36 @@ duckpipe.data_inlining_row_limit   -- max rows to inline in INSERT VALUES (defau
 - **Manual start**: `start_worker()` is still available as an explicit override.
 - **Stop**: `stop_worker()` terminates the worker. The worker has `bgw_restart_time = 10` so it auto-restarts after crash; to pause, use `ALTER SYSTEM SET duckpipe.enabled = off; SELECT pg_reload_conf();`
 
-## Test Files
+## WAL Consumption and Flush
 
-Tests are in `test/regression/sql/` with expected output in `test/regression/expected/`:
-- **auto_start.sql**: Worker auto-start on add_table()
-- **api.sql**: Group/table management API tests
-- **monitoring.sql**: groups()/tables()/status() SRF tests
-- **streaming.sql**: INSERT/UPDATE/DELETE CDC synchronization
-- **snapshot_updates.sql**: Initial copy and concurrent updates
-- **catchup_handoff.sql**: CATCHUP→STREAMING handoff with WAL backlog
-- **multiple_tables.sql**: Multiple tables in same sync group
-- **data_types.sql**: Various PostgreSQL data types
-- **resync.sql**: resync_table() functionality
-- **truncate.sql**: TRUNCATE propagation
-- **stress_append.sql**: Many single-row transactions batched efficiently
-- **premature_catchup.sql**: CATCHUP→STREAMING transition correctness under batch-limited WAL consumption
-- **snapshot_race.sql**: Snapshot race condition proof (concurrent writes during snapshot)
+WAL consumption uses streaming replication exclusively: `START_REPLICATION` protocol via `pgwire-replication` crate. pgoutput binary messages are decoded by a pure-Rust decoder in `duckpipe-core/src/decoder.rs`.
 
-## PostgreSQL Internals Used
+Each sync cycle: connect → poll up to `batch_size_per_group` WAL messages (with ~500ms timeout) → decode → push changes to `FlushCoordinator` shared queues → disconnect. No synchronous barrier between WAL processing and flush.
 
-This extension heavily uses PostgreSQL logical replication internals from `replication/logicalproto.h`:
-- `logicalrep_read_begin()`, `logicalrep_read_commit()`
-- `logicalrep_read_rel()`, `logicalrep_read_insert()`, `logicalrep_read_update()`, `logicalrep_read_delete()`
-- `logicalrep_read_truncate()`
-- `LogicalRepRelation`, `LogicalRepTupleData`, `LogicalRepBeginData`, `LogicalRepCommitData`
+**Decoupled flush architecture**: `FlushCoordinator` manages persistent per-table flush threads that are fully decoupled from the WAL consumer. Each flush thread:
+- Owns its own `FlushWorker` (DuckDB connection) and tokio runtime (for PG metadata updates)
+- Self-triggers flush based on queue size (`flush_batch_threshold`) or time (`flush_interval`)
+- Handles PG metadata updates independently (applied_lsn, metrics, error state)
+- On error: drops worker (lazily recreated), records error in PG, transitions to ERRORED after `ERRORED_THRESHOLD` consecutive failures
 
-Changes are fetched via SPI calling `pg_logical_slot_get_binary_changes()`.
+**Backpressure**: `BackpressureState` tracks total queued changes via `AtomicI64`. When `total_queued >= max_queued_changes`, the WAL consumer skips polling to let flush threads catch up. Backpressure counter is incremented on `push_change()` and decremented when flush threads drain from the shared queue.
+
+**Crash safety**: The replication slot never advances past what all tables have durably flushed. Flush threads write `applied_lsn` to PG metadata after each successful DuckDB flush. The WAL consumer periodically reads `min(applied_lsn)` from PG and uses it as `confirmed_lsn` for the `StandbyStatusUpdate`. On crash, in-flight changes in flush thread buffers are lost but replay from WAL.
+
+**TRUNCATE**: Uses per-table synchronous drain (`drain_and_wait_table()`) to ensure pending changes are flushed before `DELETE FROM` clears the target table.
+
+**Snapshot**: SQL functions (`pg_create_logical_replication_slot` + `pg_export_snapshot`) in a REPEATABLE READ transaction. Shared by bgworker and daemon.
 
 ## Requirements
 
-- PostgreSQL 14+ (uses `logicalrep_read_*` API)
-- pg_duckdb extension must be installed (pg_duckpipe depends on it via control file)
+- PostgreSQL 14+ with `wal_level=logical`
+- pg_duckdb extension installed
 - Source tables must have PRIMARY KEY
-- PostgreSQL config: `wal_level=logical`, extension in `shared_preload_libraries`
+- Extension in `shared_preload_libraries`
 
-## Development Workflow
+## Development Guidelines
 
-This project uses a test-driven development (TDD) approach for bug fixes:
-
-1. **Write a failing test first**: Create a regression test in `test/regression/sql/` that demonstrates the bug. Write the expected output in `test/regression/expected/` reflecting the **correct** (fixed) behavior. Add the test to `test/regression/schedule`.
-2. **Verify the test fails**: Run `make installcheck` (or `make check-regression TEST=<name>`) and confirm the new test fails, proving the bug exists. Inspect the diff between expected and actual output to confirm the failure mode matches the bug.
-3. **Implement the fix**: Modify the source code to fix the bug.
-4. **Verify the test passes**: Run the test again and confirm it now passes with the expected output.
+- **TDD for bug fixes**: Write a failing regression test first → verify it fails → implement fix → verify it passes.
+- **Regression verification**: Always run `make installcheck` after every major change. All 19 tests must pass before considering a change complete.
+- **Update docs after major changes**: `CLAUDE.md` (architecture, GUCs), `doc/CODE_WALKTHROUGH.md` (detailed walkthrough), `PROCESS.md` (completed work, TODOs, test coverage).
+- **Update `PROCESS.md`** after completing any implementation work.

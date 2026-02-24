@@ -349,25 +349,28 @@ Independent tokio task per table. Responsible for initial full copy from source 
 
 ### Responsibilities
 
-1. **Separate PostgreSQL connection** — From connection pool
-2. **Create temporary replication slot** — `CREATE_REPLICATION_SLOT <name> TEMPORARY LOGICAL pgoutput` to obtain a consistent (LSN, snapshot) pair
-3. **Import exported snapshot** — `SET TRANSACTION SNAPSHOT <snapshot_id>` within REPEATABLE READ transaction
-4. **Bulk copy** — Read from source via PostgreSQL connection, write to DuckLake target via embedded DuckDB (`INSERT INTO lake.schema.table ...`)
-5. **Record `consistent_point`** — Use the slot's `consistent_point` as `snapshot_lsn`
-6. **State transition** — Set table to CATCHUP with recorded `snapshot_lsn`
-7. **Cleanup** — Drop temporary slot, return connection to pool
+1. **Separate PostgreSQL connections** — Control connection (slot + snapshot export) and data connection (copy)
+2. **Create temporary logical slot via SQL** — `pg_create_logical_replication_slot(name, 'pgoutput', true)` within a REPEATABLE READ transaction to get a consistent `consistent_point` LSN
+3. **Export snapshot** — `pg_export_snapshot()` on the same control connection (same REPEATABLE READ snapshot as slot creation)
+4. **Import exported snapshot on data connection** — `SET TRANSACTION SNAPSHOT <snapshot_id>` to see the same consistent view
+5. **Bulk copy** — `DELETE FROM target; INSERT INTO target SELECT * FROM source` via the data connection
+6. **Record `consistent_point`** — Use the slot's `consistent_point` as `snapshot_lsn`
+7. **State transition** — Set table to CATCHUP with recorded `snapshot_lsn`
+8. **Cleanup** — Close control connection (temp slot auto-drops with session)
 
-### Why Temporary Replication Slot?
+### Why SQL-Based Slot Creation?
 
-Using `pg_current_wal_lsn()` with REPEATABLE READ has a data loss window: in-flight transactions may have WAL records with LSN < snapshot_lsn but haven't committed yet, so they're invisible to the snapshot. During CATCHUP, these changes would be skipped (`lsn <= snapshot_lsn`), causing data loss.
+The snapshot uses `pg_create_logical_replication_slot()` (a regular SQL function) instead of the replication protocol's `CREATE_REPLICATION_SLOT`. This is because `tokio-postgres` 0.7 does not support the `replication=database` startup parameter needed for replication-protocol connections. The SQL function provides the same `consistent_point` LSN — it has the same effect as the replication protocol command (per PostgreSQL documentation).
 
-A temporary replication slot's `consistent_point` is guaranteed to be consistent with the exported snapshot — all committed transactions visible in the snapshot have LSN <= consistent_point, and no invisible transactions have LSN <= consistent_point. This is the same approach used by v1 and pg_dump.
+The REPEATABLE READ snapshot is taken at the first query in the control transaction (the slot creation call), ensuring the snapshot and `consistent_point` are coordinated. `pg_export_snapshot()` exports this same snapshot for the data connection to import.
+
+Using `pg_current_wal_lsn()` alone (without a slot) would be unsafe: in-flight transactions may have WAL records with LSN < snapshot_lsn but haven't committed yet, so they're invisible to the snapshot. During CATCHUP, these changes would be skipped (`lsn <= snapshot_lsn`), causing data loss. The slot creation provides proper coordination.
 
 ### Why Independent?
 
 - **Does NOT touch the group's replication slot** — Uses its own temporary slot, zero impact on streaming tables
-- **Separate connection** — No coordination needed with slot consumer
-- **Parallel execution** — Multiple tables snapshot simultaneously
+- **Separate connections** — No coordination needed with slot consumer
+- **Parallel execution** — Multiple tables snapshot simultaneously (each task uses a unique slot name: `duckpipe_snap_{task_id}`)
 
 ---
 

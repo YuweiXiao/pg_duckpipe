@@ -1,0 +1,121 @@
+-- Test single large transaction with many rows
+--
+-- A single transaction inserts 500 rows. All changes accumulate
+-- during WAL processing and flush once at the end of the cycle.
+-- Verifies that large batch flushes work correctly and all rows
+-- arrive at the target.
+ALTER SYSTEM SET duckpipe.poll_interval = 100;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT duckpipe.start_worker();
+NOTICE:  Background worker started for database regression
+ start_worker 
+--------------
+ 
+(1 row)
+
+CREATE TABLE large_txn (id int primary key, val text, num int);
+SELECT duckpipe.add_table('public.large_txn', NULL, 'default', false);
+ add_table 
+-----------
+ 
+(1 row)
+
+-- Single transaction with 500 rows
+BEGIN;
+INSERT INTO large_txn
+  SELECT g, 'row_' || g, g * 10
+  FROM generate_series(1, 500) g;
+COMMIT;
+SELECT pg_sleep(5);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Verify all 500 rows arrived
+SELECT count(*) AS total_rows FROM public.large_txn_ducklake;
+ total_rows 
+------------
+        500
+(1 row)
+
+-- Verify data integrity (spot check first, last, middle)
+SELECT id, val, num FROM public.large_txn_ducklake WHERE id IN (1, 250, 500) ORDER BY id;
+ id  |   val   | num  
+-----+---------+------
+   1 | row_1   |   10
+ 250 | row_250 | 2500
+ 500 | row_500 | 5000
+(3 rows)
+
+-- Now do a large UPDATE in a single transaction
+BEGIN;
+UPDATE large_txn SET val = 'updated_' || id, num = num + 1 WHERE id <= 200;
+COMMIT;
+SELECT pg_sleep(5);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Verify updates applied
+SELECT count(*) AS updated_rows
+FROM public.large_txn_ducklake
+WHERE val LIKE 'updated_%';
+ updated_rows 
+--------------
+          200
+(1 row)
+
+-- Verify unchanged rows are intact
+SELECT id, val, num FROM public.large_txn_ducklake WHERE id = 500;
+ id  |   val   | num  
+-----+---------+------
+ 500 | row_500 | 5000
+(1 row)
+
+-- Large DELETE
+BEGIN;
+DELETE FROM large_txn WHERE id > 400;
+COMMIT;
+SELECT pg_sleep(3);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+SELECT count(*) AS remaining_rows FROM public.large_txn_ducklake;
+ remaining_rows 
+----------------
+            400
+(1 row)
+
+-- Cleanup
+SELECT duckpipe.remove_table('public.large_txn', false);
+ remove_table 
+--------------
+ 
+(1 row)
+
+DROP TABLE public.large_txn_ducklake;
+DROP TABLE large_txn;
+ALTER SYSTEM RESET duckpipe.poll_interval;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
+ stop_worker 
+-------------
+ 
+(1 row)
+
+RESET client_min_messages;

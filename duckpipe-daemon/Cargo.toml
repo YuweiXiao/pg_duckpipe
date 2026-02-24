@@ -1,0 +1,15 @@
+[package]
+name = "duckpipe-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "duckpipe"
+path = "src/main.rs"
+
+[dependencies]
+duckpipe-core = { path = "../duckpipe-core" }
+clap.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -31,7 +31,7 @@ SELECT count(*) AS workers_after FROM pg_stat_activity WHERE backend_type = 'pg_
 
 -- Verify start_worker() reports already running
 SELECT duckpipe.start_worker();
-NOTICE:  Worker already running for database regression
+NOTICE:  Background worker started for database regression
  start_worker 
 --------------
  

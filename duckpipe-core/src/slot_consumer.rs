@@ -1,0 +1,188 @@
+//! Streaming replication slot consumer using `pgwire-replication`.
+//!
+//! Implements `START_REPLICATION` streaming via the PostgreSQL wire protocol
+//! for near-zero latency WAL consumption. Falls back to SQL polling when
+//! streaming is unavailable.
+//!
+//! Design: reconnect-per-cycle. Each worker cycle creates a fresh streaming
+//! connection, receives available WAL, processes it, sends a
+//! StandbyStatusUpdate, then disconnects. Unix socket reconnect is ~1ms.
+
+use std::time::Duration;
+
+use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent};
+
+/// A streaming replication consumer for a single replication slot.
+pub struct SlotConsumer {
+    client: ReplicationClient,
+}
+
+impl SlotConsumer {
+    /// Connect to a replication slot via Unix socket.
+    ///
+    /// `start_lsn` is typically `confirmed_lsn` from the sync group metadata.
+    /// If 0, PostgreSQL starts from the slot's `restart_lsn`.
+    pub async fn connect(
+        socket_dir: &str,
+        port: u16,
+        user: &str,
+        database: &str,
+        slot: &str,
+        publication: &str,
+        start_lsn: u64,
+    ) -> Result<Self, String> {
+        let config = ReplicationConfig::unix(
+            socket_dir, port, user, "", database, slot, publication,
+        )
+        .with_start_lsn(Lsn(start_lsn))
+        .with_status_interval(Duration::from_millis(500))
+        .with_wakeup_interval(Duration::from_millis(100));
+
+        let client = ReplicationClient::connect(config)
+            .await
+            .map_err(|e| format!("streaming connect: {}", e))?;
+
+        Ok(Self { client })
+    }
+
+    /// Connect to a replication slot via TCP.
+    ///
+    /// Used by the standalone daemon which connects over the network
+    /// instead of Unix domain sockets.
+    pub async fn connect_tcp(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+        slot: &str,
+        publication: &str,
+        start_lsn: u64,
+    ) -> Result<Self, String> {
+        let config = ReplicationConfig::new(host, user, password, database, slot, publication)
+            .with_port(port)
+            .with_start_lsn(Lsn(start_lsn))
+            .with_status_interval(Duration::from_millis(500))
+            .with_wakeup_interval(Duration::from_millis(100));
+
+        let client = ReplicationClient::connect(config)
+            .await
+            .map_err(|e| format!("streaming tcp connect: {}", e))?;
+
+        Ok(Self { client })
+    }
+
+    /// Check if the replication connection is still alive.
+    pub fn is_connected(&self) -> bool {
+        self.client.is_running()
+    }
+
+    /// Poll for WAL messages up to `max_count` or until `timeout_ms` elapses.
+    ///
+    /// Returns a vec of `(lsn, pgoutput_binary_data)` tuples compatible with
+    /// `process_wal_messages()`. The crate pre-parses BEGIN/COMMIT into separate
+    /// event variants, so we synthesize the corresponding pgoutput binary messages
+    /// to keep both consumption paths feeding identical data into the shared decoder.
+    pub async fn poll_messages(
+        &mut self,
+        max_count: i32,
+        timeout_ms: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let mut messages = Vec::new();
+        let max = max_count as usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+        loop {
+            if messages.len() >= max {
+                break;
+            }
+
+            let recv_result = tokio::time::timeout_at(deadline, self.client.recv()).await;
+
+            match recv_result {
+                Err(_elapsed) => {
+                    // Timeout — return what we have
+                    break;
+                }
+                Ok(Err(e)) => {
+                    // Connection error — return what we have if non-empty, else propagate
+                    if messages.is_empty() {
+                        return Err(format!("streaming recv: {}", e));
+                    }
+                    break;
+                }
+                Ok(Ok(None)) => {
+                    // Stream ended cleanly
+                    break;
+                }
+                Ok(Ok(Some(event))) => match event {
+                    ReplicationEvent::XLogData {
+                        wal_start, data, ..
+                    } => {
+                        messages.push((wal_start.0, data.to_vec()));
+                    }
+                    ReplicationEvent::Begin {
+                        final_lsn,
+                        xid,
+                        commit_time_micros,
+                    } => {
+                        // Synthesize pgoutput 'B' (Begin) binary message:
+                        //   [type='B':u8] [final_lsn:i64] [commit_time:i64] [xid:i32]
+                        let mut buf = Vec::with_capacity(21);
+                        buf.push(b'B');
+                        buf.extend_from_slice(&(final_lsn.0 as i64).to_be_bytes());
+                        buf.extend_from_slice(&commit_time_micros.to_be_bytes());
+                        buf.extend_from_slice(&(xid as i32).to_be_bytes());
+                        messages.push((final_lsn.0, buf));
+                    }
+                    ReplicationEvent::Commit {
+                        lsn,
+                        end_lsn,
+                        commit_time_micros,
+                    } => {
+                        // Synthesize pgoutput 'C' (Commit) binary message:
+                        //   [type='C':u8] [flags=0:u8] [commit_lsn:i64] [end_lsn:i64] [commit_time:i64]
+                        let mut buf = Vec::with_capacity(26);
+                        buf.push(b'C');
+                        buf.push(0u8); // flags
+                        buf.extend_from_slice(&(lsn.0 as i64).to_be_bytes());
+                        buf.extend_from_slice(&(end_lsn.0 as i64).to_be_bytes());
+                        buf.extend_from_slice(&commit_time_micros.to_be_bytes());
+                        messages.push((end_lsn.0, buf));
+                    }
+                    ReplicationEvent::KeepAlive { .. } => {
+                        // Handled internally by crate (standby status updates)
+                    }
+                    ReplicationEvent::Message { .. } => {
+                        // Logical decoding messages — skip
+                    }
+                    ReplicationEvent::StoppedAt { .. } => {
+                        break;
+                    }
+                },
+            }
+        }
+
+        Ok(messages)
+    }
+
+    /// Send StandbyStatusUpdate to advance the replication slot.
+    ///
+    /// Reports that all WAL up to `lsn` has been durably applied.
+    /// The crate's background task sends the actual protocol message
+    /// on the next status interval.
+    pub fn send_status_update(&self, lsn: u64) {
+        self.client.update_applied_lsn(Lsn(lsn));
+    }
+
+    /// Gracefully shut down the streaming connection.
+    ///
+    /// Sends CopyDone, drains remaining events, and waits for the
+    /// background task to finish (which sends a final StandbyStatusUpdate).
+    pub async fn close(mut self) -> Result<(), String> {
+        self.client
+            .shutdown()
+            .await
+            .map_err(|e| format!("streaming shutdown: {}", e))
+    }
+}

@@ -45,11 +45,11 @@ SELECT pg_sleep(2);
 SELECT id, small_col, length(big_col) AS big_col_len
 FROM public.toast_test_ducklake ORDER BY id;
 
--- Cleanup
-SELECT duckpipe.remove_table('public.toast_test', false);
-DROP TABLE public.toast_test_ducklake;
-DROP TABLE toast_test;
-
+-- Cleanup: stop worker first so DuckDB connections are released
 SET client_min_messages = warning;
 SELECT duckpipe.stop_worker();
 RESET client_min_messages;
+
+SELECT duckpipe.remove_table('public.toast_test', false);
+DROP TABLE public.toast_test_ducklake;
+DROP TABLE toast_test;

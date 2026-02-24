@@ -1,8 +1,6 @@
 -- Stress test: many single-row transactions should be batched into few files
 
 -- Configure batching parameters
-ALTER SYSTEM SET duckpipe.batch_size_per_table = 1000;
-ALTER SYSTEM SET duckpipe.batch_size_per_group = 10000;
 ALTER SYSTEM SET duckpipe.poll_interval = 100;
 SELECT pg_reload_conf();
 
@@ -57,7 +55,5 @@ SELECT duckpipe.remove_table('public.stress_src', false);
 DROP TABLE public.stress_src_ducklake;
 DROP TABLE stress_src;
 
-ALTER SYSTEM RESET duckpipe.batch_size_per_table;
-ALTER SYSTEM RESET duckpipe.batch_size_per_group;
 ALTER SYSTEM RESET duckpipe.poll_interval;
 SELECT pg_reload_conf();

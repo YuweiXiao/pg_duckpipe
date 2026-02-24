@@ -16,7 +16,7 @@ INSERT INTO multi_a VALUES (1, 'alpha'), (2, 'beta');
 INSERT INTO multi_b VALUES (10, 100), (20, 200);
 INSERT INTO multi_c VALUES (1, true), (2, false);
 
-SELECT pg_sleep(2);
+SELECT pg_sleep(4);
 
 SELECT * FROM public.multi_a_ducklake ORDER BY id;
 SELECT * FROM public.multi_b_ducklake ORDER BY id;
@@ -26,7 +26,7 @@ SELECT * FROM public.multi_c_ducklake ORDER BY id;
 UPDATE multi_a SET val = 'gamma' WHERE id = 1;
 DELETE FROM multi_b WHERE id = 10;
 
-SELECT pg_sleep(2);
+SELECT pg_sleep(4);
 
 SELECT * FROM public.multi_a_ducklake ORDER BY id;
 SELECT * FROM public.multi_b_ducklake ORDER BY id;

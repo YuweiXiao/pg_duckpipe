@@ -36,3 +36,4 @@ output_iso/
 # Build directories
 build/
 tmp_test/
+target/

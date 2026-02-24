@@ -1,0 +1,610 @@
+//! Producer-consumer flush coordinator with persistent per-table flush threads.
+//!
+//! Flush threads are fully decoupled from WAL consumption:
+//! - Self-trigger based on queue size (batch_threshold) or time (flush_interval)
+//! - Handle PG metadata updates (applied_lsn, metrics, error state) independently
+//! - Backpressure via AtomicI64 total_queued prevents unbounded memory growth
+//!
+//! `drain_and_wait_all()` is retained for shutdown. `drain_and_wait_table()` is
+//! used for TRUNCATE (must flush before DELETE).
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use crate::duckdb_flush::FlushWorker;
+use crate::flush_worker;
+use crate::queue::TableQueue;
+use crate::types::Change;
+
+/// Maximum consecutive flush failures before transitioning to ERRORED.
+const ERRORED_THRESHOLD: i32 = 3;
+
+/// Cloneable table schema info for constructing TableQueue inside the flush thread.
+#[derive(Clone, Debug)]
+struct QueueMeta {
+    target_key: String,
+    mapping_id: i32,
+    attnames: Vec<String>,
+    key_attrs: Vec<usize>,
+    atttypes: Vec<u32>,
+}
+
+/// Shared queue data protected by Mutex.
+struct SharedTableQueue {
+    meta: QueueMeta,
+    changes: Vec<Change>,
+    last_lsn: u64,
+}
+
+/// Arc-shared handle between producer (main thread) and consumer (flush thread).
+struct TableQueueHandle {
+    inner: Mutex<SharedTableQueue>,
+    condvar: Condvar,
+}
+
+/// Lock-free thread control signals.
+struct ThreadControl {
+    shutdown: AtomicBool,
+    drain_requested: AtomicBool,
+}
+
+/// Per-table coordinator entry tracking queue, control, and thread handle.
+struct FlushThreadEntry {
+    queue_handle: Arc<TableQueueHandle>,
+    control: Arc<ThreadControl>,
+    join_handle: Option<JoinHandle<()>>,
+    drain_complete: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// Result sent from flush thread to main thread via mpsc channel.
+#[derive(Debug)]
+pub enum FlushThreadResult {
+    Success {
+        target_key: String,
+        mapping_id: i32,
+        applied_count: i64,
+        last_lsn: u64,
+    },
+    Error {
+        target_key: String,
+        mapping_id: i32,
+        error: String,
+    },
+}
+
+/// Shared backpressure state between producer (WAL consumer) and flush threads.
+struct BackpressureState {
+    /// Total number of in-flight changes (shared queues + local accumulators).
+    /// Incremented by producer on push_change(), decremented by flush threads
+    /// after flush completes or accumulated data is cleared. Using Relaxed ordering
+    /// is acceptable since backpressure is best-effort (off-by-a-few is fine).
+    total_queued: AtomicI64,
+    /// Maximum allowed queued changes before backpressure kicks in.
+    max_queued: i64,
+}
+
+/// Producer-consumer flush coordinator with persistent per-table flush threads.
+pub struct FlushCoordinator {
+    pg_connstr: String,
+    ducklake_schema: String,
+    threads: HashMap<String, FlushThreadEntry>,
+    result_tx: mpsc::Sender<FlushThreadResult>,
+    result_rx: mpsc::Receiver<FlushThreadResult>,
+    backpressure: Arc<BackpressureState>,
+    flush_batch_threshold: usize,
+    flush_interval_ms: u64,
+}
+
+impl FlushCoordinator {
+    /// Create a new coordinator. No flush threads are spawned yet.
+    pub fn new(
+        pg_connstr: String,
+        ducklake_schema: String,
+        flush_batch_threshold: i32,
+        flush_interval_ms: i32,
+        max_queued_changes: i32,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        FlushCoordinator {
+            pg_connstr,
+            ducklake_schema,
+            threads: HashMap::new(),
+            result_tx: tx,
+            result_rx: rx,
+            backpressure: Arc::new(BackpressureState {
+                total_queued: AtomicI64::new(0),
+                max_queued: max_queued_changes as i64,
+            }),
+            flush_batch_threshold: flush_batch_threshold as usize,
+            flush_interval_ms: flush_interval_ms as u64,
+        }
+    }
+
+    /// Ensure a queue + flush thread exists for the given target table.
+    /// Creates and spawns if new. No-op if the entry already exists and the thread is alive.
+    /// If the thread has died (join_handle finished), respawns it.
+    pub fn ensure_queue(
+        &mut self,
+        target_key: &str,
+        mapping_id: i32,
+        attnames: Vec<String>,
+        key_attrs: Vec<usize>,
+        atttypes: Vec<u32>,
+    ) {
+        // Check if entry exists and thread is alive
+        let needs_spawn = match self.threads.get(target_key) {
+            None => true,
+            Some(entry) => {
+                match &entry.join_handle {
+                    Some(h) => h.is_finished(),
+                    None => true,
+                }
+            }
+        };
+
+        if !needs_spawn {
+            return;
+        }
+
+        // If the old thread is finished, join it and remove entry
+        if let Some(mut old) = self.threads.remove(target_key) {
+            old.control.shutdown.store(true, Ordering::Release);
+            old.queue_handle.condvar.notify_one();
+            if let Some(h) = old.join_handle.take() {
+                let _ = h.join();
+            }
+        }
+
+        let meta = QueueMeta {
+            target_key: target_key.to_string(),
+            mapping_id,
+            attnames,
+            key_attrs,
+            atttypes,
+        };
+
+        let queue_handle = Arc::new(TableQueueHandle {
+            inner: Mutex::new(SharedTableQueue {
+                meta: meta.clone(),
+                changes: Vec::new(),
+                last_lsn: 0,
+            }),
+            condvar: Condvar::new(),
+        });
+
+        let control = Arc::new(ThreadControl {
+            shutdown: AtomicBool::new(false),
+            drain_requested: AtomicBool::new(false),
+        });
+
+        let drain_complete = Arc::new((Mutex::new(false), Condvar::new()));
+
+        // Clone Arcs for the thread
+        let qh = Arc::clone(&queue_handle);
+        let ctrl = Arc::clone(&control);
+        let dc = Arc::clone(&drain_complete);
+        let tx = self.result_tx.clone();
+        let pg_connstr = self.pg_connstr.clone();
+        let ducklake_schema = self.ducklake_schema.clone();
+        let bp = Arc::clone(&self.backpressure);
+        let batch_threshold = self.flush_batch_threshold;
+        let interval_ms = self.flush_interval_ms;
+
+        let join_handle = std::thread::Builder::new()
+            .name(format!("duckpipe-flush-{}", target_key))
+            .spawn(move || {
+                flush_thread_main(
+                    qh,
+                    ctrl,
+                    dc,
+                    tx,
+                    &pg_connstr,
+                    &ducklake_schema,
+                    bp,
+                    batch_threshold,
+                    interval_ms,
+                );
+            })
+            .expect("failed to spawn flush thread");
+
+        self.threads.insert(
+            target_key.to_string(),
+            FlushThreadEntry {
+                queue_handle,
+                control,
+                join_handle: Some(join_handle),
+                drain_complete,
+            },
+        );
+    }
+
+    /// Push a change into the shared queue for the given target table.
+    /// The target queue must have been created via `ensure_queue()`.
+    pub fn push_change(&self, target_key: &str, change: Change) {
+        if let Some(entry) = self.threads.get(target_key) {
+            let mut guard = entry.queue_handle.inner.lock().unwrap();
+            if change.lsn > guard.last_lsn {
+                guard.last_lsn = change.lsn;
+            }
+            guard.changes.push(change);
+            self.backpressure.total_queued.fetch_add(1, Ordering::Relaxed);
+            entry.queue_handle.condvar.notify_one();
+        }
+    }
+
+    /// Check if backpressure should pause WAL consumption.
+    pub fn is_backpressured(&self) -> bool {
+        self.backpressure.total_queued.load(Ordering::Relaxed) >= self.backpressure.max_queued
+    }
+
+    /// Per-table synchronous drain: signal one flush thread to drain, wait for completion.
+    /// Used for TRUNCATE — must flush pending changes before DELETE.
+    pub fn drain_and_wait_table(&mut self, target_key: &str) {
+        if let Some(entry) = self.threads.get(target_key) {
+            // Reset drain_complete flag
+            {
+                let mut done = entry.drain_complete.0.lock().unwrap();
+                *done = false;
+            }
+            entry.control.drain_requested.store(true, Ordering::Release);
+            entry.queue_handle.condvar.notify_one();
+
+            // Wait for completion
+            let (lock, cvar) = &*entry.drain_complete;
+            let guard = lock.lock().unwrap();
+            let _guard = cvar
+                .wait_timeout_while(guard, Duration::from_secs(30), |done| !*done)
+                .unwrap()
+                .0;
+        }
+    }
+
+    /// Synchronous barrier: signal all flush threads to drain their queues,
+    /// wait for all to complete, then collect results.
+    /// Retained for shutdown.
+    pub fn drain_and_wait_all(&mut self) -> Vec<FlushThreadResult> {
+        // Signal all threads to drain
+        let active_keys: Vec<String> = self.threads.keys().cloned().collect();
+
+        for key in &active_keys {
+            if let Some(entry) = self.threads.get(key) {
+                // Reset drain_complete flag
+                {
+                    let mut done = entry.drain_complete.0.lock().unwrap();
+                    *done = false;
+                }
+                entry.control.drain_requested.store(true, Ordering::Release);
+                entry.queue_handle.condvar.notify_one();
+            }
+        }
+
+        // Wait for each thread to signal drain_complete
+        for key in &active_keys {
+            if let Some(entry) = self.threads.get(key) {
+                let (lock, cvar) = &*entry.drain_complete;
+                let guard = lock.lock().unwrap();
+                // Wait with timeout to avoid deadlock if thread died
+                let _guard = cvar
+                    .wait_timeout_while(guard, Duration::from_secs(30), |done| !*done)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        // Collect all pending results from the channel
+        self.collect_results()
+    }
+
+    /// Non-blocking drain of the mpsc result channel.
+    pub fn collect_results(&self) -> Vec<FlushThreadResult> {
+        let mut results = Vec::new();
+        while let Ok(r) = self.result_rx.try_recv() {
+            results.push(r);
+        }
+        results
+    }
+
+    /// Signal all flush threads to stop and join them.
+    pub fn shutdown(&mut self) {
+        for (_, entry) in self.threads.iter() {
+            entry.control.shutdown.store(true, Ordering::Release);
+            entry.queue_handle.condvar.notify_one();
+        }
+        for (_, entry) in self.threads.iter_mut() {
+            if let Some(h) = entry.join_handle.take() {
+                let _ = h.join();
+            }
+        }
+        self.threads.clear();
+    }
+
+    /// Shutdown all threads + recreate mpsc channel (used for panic recovery).
+    pub fn clear(&mut self) {
+        self.shutdown();
+        let (tx, rx) = mpsc::channel();
+        self.result_tx = tx;
+        self.result_rx = rx;
+    }
+
+    /// Get the PG connection string.
+    pub fn pg_connstr(&self) -> &str {
+        &self.pg_connstr
+    }
+
+    /// Get the DuckLake metadata schema name.
+    pub fn ducklake_schema(&self) -> &str {
+        &self.ducklake_schema
+    }
+}
+
+impl Drop for FlushCoordinator {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Main loop for a persistent flush thread (self-triggered).
+///
+/// Each thread owns its own `FlushWorker` (with a DuckDB connection).
+/// On flush error, the worker is dropped and lazily recreated on the next iteration.
+///
+/// Self-trigger logic: flush when accumulated changes >= batch_threshold OR
+/// time since last flush >= flush_interval. Flush threads also handle PG metadata
+/// updates (applied_lsn, metrics, error state) via their own tokio runtime.
+fn flush_thread_main(
+    queue_handle: Arc<TableQueueHandle>,
+    control: Arc<ThreadControl>,
+    drain_complete: Arc<(Mutex<bool>, Condvar)>,
+    result_tx: mpsc::Sender<FlushThreadResult>,
+    pg_connstr: &str,
+    ducklake_schema: &str,
+    backpressure: Arc<BackpressureState>,
+    batch_threshold: usize,
+    flush_interval_ms: u64,
+) {
+    // Each flush thread owns its own tokio runtime for async PG metadata updates.
+    // This avoids deadlock with the main thread's current_thread runtime, since
+    // tokio_postgres::connect spawns a connection driver task that must be polled.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create flush thread runtime");
+
+    let mut worker: Option<FlushWorker> = None;
+    let mut accumulated: Vec<Change> = Vec::new();
+    let mut accumulated_count: i64 = 0; // tracks changes in local accumulator for backpressure
+    let mut accumulated_lsn: u64 = 0;
+    let mut accumulated_meta: Option<QueueMeta> = None;
+    let mut last_flush = Instant::now();
+    let flush_interval = Duration::from_millis(flush_interval_ms);
+
+    loop {
+        // Calculate remaining time until next time-based flush
+        let elapsed = last_flush.elapsed();
+        let wait_timeout = if accumulated.is_empty() {
+            // No accumulated changes — wait for full interval
+            flush_interval
+        } else if elapsed >= flush_interval {
+            // Already past interval — don't wait
+            Duration::ZERO
+        } else {
+            flush_interval - elapsed
+        };
+
+        // Lock shared queue, drain new changes and check signals
+        let drain_requested;
+        {
+            let mut guard = queue_handle.inner.lock().unwrap();
+
+            // Wait with timeout for new changes, drain request, or shutdown
+            if guard.changes.is_empty()
+                && !control.shutdown.load(Ordering::Acquire)
+                && !control.drain_requested.load(Ordering::Acquire)
+                && wait_timeout > Duration::ZERO
+            {
+                let (new_guard, _timeout_result) = queue_handle
+                    .condvar
+                    .wait_timeout(guard, wait_timeout)
+                    .unwrap();
+                guard = new_guard;
+            }
+
+            // Check shutdown
+            if control.shutdown.load(Ordering::Acquire) {
+                // Flush any accumulated changes before exit
+                if !accumulated.is_empty() {
+                    if let Some(meta) = accumulated_meta.as_ref() {
+                        do_flush(
+                            &mut worker,
+                            &mut accumulated,
+                            accumulated_lsn,
+                            meta,
+                            pg_connstr,
+                            ducklake_schema,
+                            &result_tx,
+                            &rt,
+                        );
+                    }
+                    accumulated.clear();
+                    backpressure.total_queued.fetch_sub(accumulated_count, Ordering::Relaxed);
+                }
+                // Signal drain_complete if requested
+                if control.drain_requested.load(Ordering::Acquire) {
+                    signal_drain_complete(&drain_complete, &control);
+                }
+                return;
+            }
+
+            // Drain new changes from the shared queue into local accumulator
+            if !guard.changes.is_empty() {
+                let count = guard.changes.len() as i64;
+                let changes = std::mem::take(&mut guard.changes);
+                if guard.last_lsn > accumulated_lsn {
+                    accumulated_lsn = guard.last_lsn;
+                }
+                if accumulated_meta.is_none() {
+                    accumulated_meta = Some(guard.meta.clone());
+                }
+                drop(guard); // Release lock before extending accumulator
+
+                accumulated.extend(changes);
+                accumulated_count += count;
+                // Note: backpressure counter is NOT decremented here.
+                // It is decremented after flush/clear to accurately reflect
+                // all in-flight data (shared queues + local accumulators).
+            } else {
+                drop(guard);
+            }
+
+            drain_requested = control.drain_requested.load(Ordering::Acquire);
+        }
+
+        // Determine whether to flush
+        let should_flush = if drain_requested {
+            // Explicit drain request (TRUNCATE or shutdown) — always flush
+            true
+        } else if accumulated.is_empty() {
+            false
+        } else if accumulated.len() >= batch_threshold {
+            // Batch threshold reached
+            true
+        } else {
+            // Time threshold reached
+            last_flush.elapsed() >= flush_interval
+        };
+
+        if should_flush && !accumulated.is_empty() {
+            if let Some(meta) = accumulated_meta.as_ref() {
+                do_flush(
+                    &mut worker,
+                    &mut accumulated,
+                    accumulated_lsn,
+                    meta,
+                    pg_connstr,
+                    ducklake_schema,
+                    &result_tx,
+                    &rt,
+                );
+            }
+            accumulated.clear();
+            backpressure.total_queued.fetch_sub(accumulated_count, Ordering::Relaxed);
+            accumulated_count = 0;
+            accumulated_lsn = 0;
+            last_flush = Instant::now();
+        }
+
+        // Signal drain_complete if a drain was requested
+        if drain_requested {
+            signal_drain_complete(&drain_complete, &control);
+        }
+    }
+}
+
+/// Execute a flush: build TableQueue, run FlushWorker, update PG metadata.
+fn do_flush(
+    worker: &mut Option<FlushWorker>,
+    accumulated: &mut Vec<Change>,
+    last_lsn: u64,
+    meta: &QueueMeta,
+    pg_connstr: &str,
+    ducklake_schema: &str,
+    result_tx: &mpsc::Sender<FlushThreadResult>,
+    rt: &tokio::runtime::Runtime,
+) {
+    // Build a TableQueue from accumulated changes
+    let mut table_queue = TableQueue::new(
+        meta.target_key.clone(),
+        meta.mapping_id,
+        meta.attnames.clone(),
+        meta.key_attrs.clone(),
+        meta.atttypes.clone(),
+    );
+    for change in accumulated.drain(..) {
+        table_queue.push(change);
+    }
+
+    // Ensure we have a FlushWorker
+    if worker.is_none() {
+        match FlushWorker::new(pg_connstr, ducklake_schema) {
+            Ok(w) => *worker = Some(w),
+            Err(e) => {
+                let error_msg = format!("failed to create FlushWorker: {}", e);
+                let _ = result_tx.send(FlushThreadResult::Error {
+                    target_key: meta.target_key.clone(),
+                    mapping_id: meta.mapping_id,
+                    error: error_msg.clone(),
+                });
+                // Update error state in PG
+                let _ = rt.block_on(flush_worker::update_error_state(
+                    pg_connstr,
+                    meta.mapping_id,
+                    &error_msg,
+                    ERRORED_THRESHOLD,
+                ));
+                return;
+            }
+        }
+    }
+
+    // Flush
+    match worker.as_mut().unwrap().flush(table_queue) {
+        Ok(result) => {
+            // Update PG metadata: metrics + applied_lsn
+            if let Err(e) = rt.block_on(flush_worker::update_metrics_via_pg(
+                pg_connstr,
+                result.mapping_id,
+                result.applied_count,
+                last_lsn,
+            )) {
+                eprintln!(
+                    "pg_duckpipe: metrics update failed for {}: {}",
+                    result.target_key, e
+                );
+            }
+            // Clear error state on success
+            let _ = rt.block_on(flush_worker::clear_error_on_success(
+                pg_connstr,
+                result.mapping_id,
+            ));
+
+            let _ = result_tx.send(FlushThreadResult::Success {
+                target_key: result.target_key,
+                mapping_id: result.mapping_id,
+                applied_count: result.applied_count,
+                last_lsn,
+            });
+        }
+        Err(e) => {
+            // Drop worker on error — will be recreated on next iteration
+            *worker = None;
+            let _ = result_tx.send(FlushThreadResult::Error {
+                target_key: meta.target_key.clone(),
+                mapping_id: meta.mapping_id,
+                error: e.clone(),
+            });
+            // Update error state in PG
+            let _ = rt.block_on(flush_worker::update_error_state(
+                pg_connstr,
+                meta.mapping_id,
+                &e,
+                ERRORED_THRESHOLD,
+            ));
+        }
+    }
+}
+
+/// Helper: signal the drain_complete condvar and clear the drain_requested flag.
+fn signal_drain_complete(
+    drain_complete: &Arc<(Mutex<bool>, Condvar)>,
+    control: &Arc<ThreadControl>,
+) {
+    let (lock, cvar) = &**drain_complete;
+    let mut done = lock.lock().unwrap();
+    *done = true;
+    control.drain_requested.store(false, Ordering::Release);
+    cvar.notify_one();
+}
