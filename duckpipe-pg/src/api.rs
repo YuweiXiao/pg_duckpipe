@@ -823,7 +823,10 @@ CREATE FUNCTION duckpipe.status() RETURNS TABLE(
     enabled BOOLEAN,
     rows_synced BIGINT,
     last_sync TIMESTAMPTZ,
-    error_message TEXT
+    error_message TEXT,
+    consecutive_failures INTEGER,
+    retry_at TIMESTAMPTZ,
+    applied_lsn TEXT
 )
 AS 'MODULE_PATHNAME', '@FUNCTION_NAME@'
 LANGUAGE C STRICT;
@@ -839,6 +842,9 @@ fn status() -> TableIterator<
         name!(rows_synced, i64),
         name!(last_sync, Option<TimestampWithTimeZone>),
         name!(error_message, Option<String>),
+        name!(consecutive_failures, i32),
+        name!(retry_at, Option<TimestampWithTimeZone>),
+        name!(applied_lsn, Option<String>),
     ),
 > {
     let mut rows = Vec::new();
@@ -848,7 +854,8 @@ fn status() -> TableIterator<
             "SELECT g.name as sync_group, \
              m.source_schema || '.' || m.source_table as source_table, \
              m.target_schema || '.' || m.target_table as target_table, \
-             m.state, m.enabled, m.rows_synced, m.last_sync_at, m.error_message \
+             m.state, m.enabled, m.rows_synced, m.last_sync_at, m.error_message, \
+             m.consecutive_failures, m.retry_at, m.applied_lsn::text \
              FROM duckpipe.table_mappings m \
              JOIN duckpipe.sync_groups g ON m.group_id = g.id \
              ORDER BY g.name, m.source_schema, m.source_table",
@@ -866,6 +873,9 @@ fn status() -> TableIterator<
                 let rows_synced: i64 = row.get(6).unwrap().unwrap();
                 let last_sync: Option<TimestampWithTimeZone> = row.get(7).unwrap();
                 let error_message: Option<String> = row.get(8).unwrap();
+                let consecutive_failures: i32 = row.get::<i32>(9).unwrap().unwrap_or(0);
+                let retry_at: Option<TimestampWithTimeZone> = row.get(10).unwrap();
+                let applied_lsn: Option<String> = row.get(11).unwrap();
 
                 rows.push((
                     sync_group,
@@ -876,7 +886,51 @@ fn status() -> TableIterator<
                     rows_synced,
                     last_sync,
                     error_message,
+                    consecutive_failures,
+                    retry_at,
+                    applied_lsn,
                 ));
+            }
+        }
+    });
+
+    TableIterator::new(rows)
+}
+
+#[pg_extern(sql = "
+CREATE FUNCTION duckpipe.worker_status() RETURNS TABLE(
+    total_queued_changes BIGINT,
+    is_backpressured BOOLEAN,
+    updated_at TIMESTAMPTZ
+)
+AS 'MODULE_PATHNAME', '@FUNCTION_NAME@'
+LANGUAGE C STRICT;
+")]
+fn worker_status() -> TableIterator<
+    'static,
+    (
+        name!(total_queued_changes, i64),
+        name!(is_backpressured, bool),
+        name!(updated_at, Option<TimestampWithTimeZone>),
+    ),
+> {
+    let mut rows = Vec::new();
+
+    Spi::connect(|client| {
+        let result = client.select(
+            "SELECT total_queued_changes, is_backpressured, updated_at \
+             FROM duckpipe.worker_state WHERE id = 1",
+            None,
+            &[],
+        );
+
+        if let Ok(tuptable) = result {
+            for row in tuptable {
+                let total_queued_changes: i64 = row.get::<i64>(1).unwrap().unwrap_or(0);
+                let is_backpressured: bool = row.get::<bool>(2).unwrap().unwrap_or(false);
+                let updated_at: Option<TimestampWithTimeZone> = row.get(3).unwrap();
+
+                rows.push((total_queued_changes, is_backpressured, updated_at));
             }
         }
     });

@@ -634,59 +634,17 @@ After the message loop:
 
 ### 6.1 `lib.rs`
 
-Extension entry point. `_PG_init` registers GUC parameters:
+Extension entry point. `_PG_init` registers GUC parameters and the background worker.
 
-| GUC | Type | Default | Context | Description |
-|-----|------|---------|---------|-------------|
-| `duckpipe.poll_interval` | int (ms) | 1000 | SIGHUP | Worker polling interval |
-| `duckpipe.batch_size_per_group` | int | 100000 | SIGHUP | Max WAL messages per group per sync cycle |
-| `duckpipe.enabled` | bool | true | SIGHUP | Master worker enable switch |
-| `duckpipe.debug_log` | bool | false | SIGHUP | Timing diagnostics |
-| `duckpipe.data_inlining_row_limit` | int | 0 | USERSET | DuckLake data inlining threshold |
-| `duckpipe.flush_interval` | int (ms) | 1000 | SIGHUP | Self-triggered flush interval (100–60000) |
-| `duckpipe.flush_batch_threshold` | int | 10000 | SIGHUP | Queue size that triggers immediate flush (100–1000000) |
-| `duckpipe.max_queued_changes` | int | 500000 | SIGHUP | Backpressure threshold (1000–10000000) |
-
-All SIGHUP params require `ALTER SYSTEM SET ... ; SELECT pg_reload_conf();`
+GUCs registered: `poll_interval`, `batch_size_per_group`, `enabled`, `debug_log`, `data_inlining_row_limit`, `flush_interval`, `flush_batch_threshold`, `max_queued_changes`. See [USAGE.md](./USAGE.md#configuration-gucs) for full parameter reference.
 
 ### 6.2 `api.rs`
 
-SQL-callable functions. All are REVOKE'd from PUBLIC by default.
+SQL-callable functions. All are REVOKE'd from PUBLIC by default. See [USAGE.md](./USAGE.md#sql-api) for full API reference with parameters and examples.
 
-**Group Management:**
+Functions implemented: `create_group`, `drop_group`, `enable_group`, `disable_group`, `add_table`, `remove_table`, `move_table`, `resync_table`, `start_worker`, `stop_worker`, and monitoring SRFs (`groups()`, `tables()`, `status()`, `worker_status()`).
 
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `create_group` | `(name, publication?, slot_name?)` | TEXT | Creates publication + slot + metadata row |
-| `drop_group` | `(name, drop_slot? = true)` | void | Drops everything |
-| `enable_group` | `(name)` | void | Sets `enabled = true` |
-| `disable_group` | `(name)` | void | Sets `enabled = false` |
-
-**Table Management:**
-
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `add_table` | `(source_table, target_table?, sync_group? = 'default', copy_data? = true)` | void | Adds table to publication, creates target, inserts mapping |
-| `remove_table` | `(source_table, drop_target? = false)` | void | Removes from publication, deletes mapping |
-| `move_table` | `(source_table, new_group)` | void | Changes group_id |
-| `resync_table` | `(source_table)` | void | TRUNCATEs target, resets to SNAPSHOT state |
-
-**Worker Lifecycle:**
-
-| Function | Description |
-|----------|-------------|
-| `start_worker()` | Registers dynamic background worker (no-op if already running) |
-| `stop_worker()` | Terminates worker via `pg_terminate_backend()`, waits up to 5s |
-
-**Monitoring (Set-Returning Functions):**
-
-| Function | Key Columns | Description |
-|----------|-------------|-------------|
-| `groups()` | name, publication, slot_name, enabled, table_count, lag_bytes, last_sync | Group overview with WAL lag |
-| `tables()` | source_table, target_table, sync_group, enabled, rows_synced, last_sync | Table overview |
-| `status()` | sync_group, source_table, target_table, state, enabled, rows_synced, last_sync, error_message | Detailed status with errors |
-
-**`add_table` details** — the most complex function:
+**`add_table` implementation** — the most complex function:
 1. Parse source table name (default schema: `public`)
 2. Generate target name: `{schema}.{table}_ducklake` (or use provided name)
 3. Look up sync group to get publication + slot
@@ -1000,52 +958,6 @@ SELECT duckpipe.remove_table('public.source_table');
 
 ---
 
-## 11. Build and Run
+## 11. Build, Run, and Usage
 
-### Prerequisites
-
-- PostgreSQL 14+ with `wal_level = logical`
-- pg_duckdb extension installed
-- Rust toolchain + `cargo-pgrx`
-
-### Build Commands
-
-```bash
-make                            # Build and install PG extension
-make installcheck               # Build + install + run all 19 regression tests
-make check-regression TEST=api  # Run a single test
-make format                     # cargo fmt
-make clean                      # cargo clean
-```
-
-### Mode 1: Background Worker
-
-```sql
-CREATE EXTENSION pg_duckpipe;   -- Loads extension, creates schema, default group
-
--- Add a table (auto-starts worker, auto-creates target)
-SELECT duckpipe.add_table('public.orders');
-
--- Monitor
-SELECT * FROM duckpipe.status();
-SELECT * FROM duckpipe.groups();
-
--- Tune
-ALTER SYSTEM SET duckpipe.poll_interval = 500;
-SELECT pg_reload_conf();
-```
-
-### Mode 2: Standalone Daemon
-
-```bash
-# Build
-cargo build --release -p duckpipe-daemon
-
-# Run (metadata tables must already exist via CREATE EXTENSION)
-./target/release/duckpipe \
-    --connstr "host=localhost port=5432 dbname=mydb user=replicator" \
-    --poll-interval 500 \
-    --debug
-```
-
-Both modes operate on the same `duckpipe.sync_groups` and `duckpipe.table_mappings` tables. Only one consumer (bgworker or daemon) should be active per replication slot at a time.
+See [USAGE.md](./USAGE.md) for build commands, SQL API reference, configuration parameters, monitoring, and usage examples.

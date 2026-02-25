@@ -241,6 +241,11 @@ impl FlushCoordinator {
         self.backpressure.total_queued.load(Ordering::Relaxed) >= self.backpressure.max_queued
     }
 
+    /// Get the current total queued changes count (for observability).
+    pub fn total_queued(&self) -> i64 {
+        self.backpressure.total_queued.load(Ordering::Relaxed)
+    }
+
     /// Per-table synchronous drain: signal one flush thread to drain, wait for completion.
     /// Used for TRUNCATE — must flush pending changes before DELETE.
     pub fn drain_and_wait_table(&mut self, target_key: &str) {

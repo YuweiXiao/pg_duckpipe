@@ -733,6 +733,11 @@ pub async fn run_sync_cycle(
         }
     }
 
+    // Update worker runtime state for observability
+    let _ = meta
+        .update_worker_state(coordinator.total_queued(), coordinator.is_backpressured())
+        .await;
+
     // Clean up metadata connection
     drop(client);
     let _ = conn_handle.await;

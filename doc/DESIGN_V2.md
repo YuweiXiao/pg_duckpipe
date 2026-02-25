@@ -1,5 +1,7 @@
 # pg_duckpipe v2: Architecture Design
 
+> **Historical document.** This was the initial design for the v2 Rust rewrite. The implementation diverged in several ways (e.g., DELETE+INSERT replaced MERGE, per-thread tokio runtimes replaced `deadpool-postgres`, `source_uri` not yet implemented). For the current architecture, see [CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md). For usage, see [USAGE.md](./USAGE.md).
+
 ## Executive Summary
 
 pg_duckpipe v2 is a complete redesign of the CDC sync service from PostgreSQL heap tables to DuckLake columnar tables. The redesign addresses v1's single-threaded processing and adds parallelism, dual deployment capability, and DuckLake-specific optimizations.

@@ -21,11 +21,20 @@ SELECT source_table, target_table, sync_group, enabled FROM duckpipe.tables();
  public.mon_test | public.mon_test_ducklake | default    | t
 (1 row)
 
--- Test duckpipe.status() returns state info
-SELECT sync_group, source_table, target_table, state, enabled FROM duckpipe.status();
- sync_group |  source_table   |       target_table       |   state   | enabled 
-------------+-----------------+--------------------------+-----------+---------
- default    | public.mon_test | public.mon_test_ducklake | STREAMING | t
+-- Test duckpipe.status() returns state info including new observability columns
+SELECT sync_group, source_table, target_table, state, enabled,
+       consecutive_failures, retry_at, applied_lsn
+FROM duckpipe.status();
+ sync_group |  source_table   |       target_table       |   state   | enabled | consecutive_failures | retry_at | applied_lsn 
+------------+-----------------+--------------------------+-----------+---------+----------------------+----------+-------------
+ default    | public.mon_test | public.mon_test_ducklake | STREAMING | t       |                    0 |          | 
+(1 row)
+
+-- Test duckpipe.worker_status() returns runtime state
+SELECT total_queued_changes, is_backpressured FROM duckpipe.worker_status();
+ total_queued_changes | is_backpressured 
+----------------------+------------------
+                    0 | f
 (1 row)
 
 -- Cleanup

@@ -535,6 +535,22 @@ impl<'a> MetadataClient<'a> {
         Ok(())
     }
 
+    /// Update worker runtime state (called once per sync cycle for observability).
+    pub async fn update_worker_state(
+        &self,
+        total_queued_changes: i64,
+        is_backpressured: bool,
+    ) -> Result<(), tokio_postgres::Error> {
+        self.client
+            .execute(
+                "UPDATE duckpipe.worker_state SET total_queued_changes = $1, \
+                 is_backpressured = $2, updated_at = now() WHERE id = 1",
+                &[&total_queued_changes, &is_backpressured],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Check if a replication slot exists.
     pub async fn slot_exists(&self, slot_name: &str) -> Result<bool, tokio_postgres::Error> {
         let rows = self
