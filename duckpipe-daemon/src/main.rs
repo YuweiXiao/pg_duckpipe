@@ -116,18 +116,7 @@ fn build_tokio_pg_connstr(params: &ConnParams) -> String {
 async fn main() {
     let args = Args::parse();
 
-    // Initialize tracing
-    let filter = if args.debug {
-        "duckpipe=debug,duckpipe_core=debug,info"
-    } else {
-        "duckpipe=info,duckpipe_core=info,warn"
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .init();
+    duckpipe_core::log::init_subscriber(args.debug);
 
     let conn_params = parse_connstr(&args.connstr);
     let pg_connstr = build_tokio_pg_connstr(&conn_params);

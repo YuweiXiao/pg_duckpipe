@@ -22,6 +22,7 @@ pg18 = ["pgrx/pg18"]
 duckpipe-core = { path = "../duckpipe-core" }
 pgrx = "0.16.1"
 tokio.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 pgrx-pg-config = "0.16.1"

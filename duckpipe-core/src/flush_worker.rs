@@ -17,7 +17,7 @@ pub async fn update_metrics_via_pg(
 
     let conn_handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("pg_duckpipe: metrics connection error: {}", e);
+            tracing::error!("pg_duckpipe: metrics connection error: {}", e);
         }
     });
 
@@ -56,7 +56,7 @@ pub async fn update_error_state(
 
     let conn_handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("pg_duckpipe: error_state connection error: {}", e);
+            tracing::error!("pg_duckpipe: error_state connection error: {}", e);
         }
     });
 
@@ -70,7 +70,7 @@ pub async fn update_error_state(
             let _ = meta
                 .set_errored_with_retry(mapping_id, error, backoff)
                 .await;
-            eprintln!(
+            tracing::warn!(
                 "pg_duckpipe: mapping {} transitioned to ERRORED after {} failures, retry in {}s",
                 mapping_id, count, backoff
             );
@@ -94,7 +94,7 @@ pub async fn clear_error_on_success(
 
     let conn_handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("pg_duckpipe: clear_error connection error: {}", e);
+            tracing::error!("pg_duckpipe: clear_error connection error: {}", e);
         }
     });
 

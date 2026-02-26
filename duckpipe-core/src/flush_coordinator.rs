@@ -647,7 +647,7 @@ fn do_flush(
                 result.applied_count,
                 last_lsn,
             )) {
-                eprintln!(
+                tracing::error!(
                     "pg_duckpipe: metrics update failed for {}: {}",
                     result.target_key, e
                 );

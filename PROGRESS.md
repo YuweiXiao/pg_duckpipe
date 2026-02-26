@@ -48,8 +48,21 @@
 #### Robustness
 - [ ] Graceful handling of DuckLake schema drift (target table altered outside duckpipe)
 - [ ] Connection pooling for flush thread PG metadata updates (currently short-lived connections per flush)
-- [ ] reognanize logging with global setup and control (e.g., format, log level)
+- [x] Standardize logging: shared `init_subscriber`, all `eprintln!` replaced with `tracing` macros
 - [ ] regressions / tests for crash / error cases
+
+### Phase 7: Standardized Logging
+- `duckpipe-core/src/log.rs` (new) — `init_subscriber(debug: bool)`: shared tracing-subscriber setup; `RUST_LOG` overrides the default filter
+- `duckpipe-core/Cargo.toml` — added `tracing-subscriber.workspace = true`
+- `duckpipe-pg/Cargo.toml` — added `tracing.workspace = true`
+- `duckpipe-daemon/Cargo.toml` — removed `tracing-subscriber` (now owned by `duckpipe-core`)
+- Replaced all `eprintln!` across core crates with typed tracing macros:
+  - Connection errors → `tracing::error!`
+  - ERRORED transition / periodic refresh failure → `tracing::warn!`
+  - Auto-retry events → `tracing::info!`
+  - Critical-path timing logs → `tracing::debug!`
+- `duckpipe-daemon/src/main.rs` — inline subscriber setup replaced with `duckpipe_core::log::init_subscriber(args.debug)`
+- `duckpipe-pg/src/worker.rs` — calls `init_subscriber(DEBUG_LOG.get())` once at bgworker startup (stderr captured by PostgreSQL log collector)
 
 ---
 

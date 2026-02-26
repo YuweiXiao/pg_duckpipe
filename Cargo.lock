@@ -744,6 +744,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -754,7 +755,6 @@ dependencies = [
  "duckpipe-core",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1782,6 +1782,7 @@ dependencies = [
  "pgrx",
  "pgrx-pg-config",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

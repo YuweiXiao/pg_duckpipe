@@ -48,9 +48,9 @@ Heap Tables → WAL → Replication Slot (pgoutput) → Decoder → FlushCoordin
 | `doc/USAGE.md` | User-facing: SQL API, monitoring, GUCs, tuning |
 | `doc/CODE_WALKTHROUGH.md` | Developer-facing: detailed code walkthrough |
 | `doc/DESIGN_V2.md` | Historical: original v2 architecture design |
-| `PROCESS.md` | Implementation progress: done/todo checklist + detailed phase history |
+| `PROGRESS.md` | Implementation progress: done/todo checklist + detailed phase history |
 
 ## Dev Guidelines
 
 - **TDD**: failing test first → fix → `make installcheck` (all must pass)
-- **Docs**: update `CLAUDE.md`, `doc/CODE_WALKTHROUGH.md`, `PROCESS.md` after major changes
+- **Docs**: update `CLAUDE.md`, `doc/CODE_WALKTHROUGH.md`, `PROGRESS.md` after major changes

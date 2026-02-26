@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 duckdb.workspace = true

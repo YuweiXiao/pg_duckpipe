@@ -94,6 +94,10 @@ pub extern "C-unwind" fn duckpipe_worker_main(arg: pg_sys::Datum) {
         (dbname, port, socket_dir)
     };
 
+    // Initialize tracing — stderr output is captured by PostgreSQL's log collector.
+    // Level is set from duckpipe.debug_log at startup; use RUST_LOG to override.
+    duckpipe_core::log::init_subscriber(DEBUG_LOG.get());
+
     // Build tokio runtime (single-threaded — bgworker safety)
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -167,7 +171,7 @@ pub extern "C-unwind" fn duckpipe_worker_main(arg: pg_sys::Datum) {
                             }
                         }
                         Err(msg) => {
-                            eprintln!("pg_duckpipe worker error: {}", msg);
+                            tracing::error!("pg_duckpipe worker error: {}", msg);
                             consumers.clear();
                             if should_shutdown() {
                                 break;
@@ -205,7 +209,7 @@ pub extern "C-unwind" fn duckpipe_worker_main(arg: pg_sys::Datum) {
                 } else {
                     "unknown error".to_string()
                 };
-                eprintln!("pg_duckpipe worker caught error: {}", msg);
+                tracing::error!("pg_duckpipe worker caught error: {}", msg);
                 if should_shutdown() {
                     break;
                 }

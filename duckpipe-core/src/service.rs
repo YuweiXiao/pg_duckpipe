@@ -173,7 +173,7 @@ async fn process_sync_group_streaming(
     }
 
     if let Some(start) = group_start {
-        eprintln!(
+        tracing::debug!(
             "DuckPipe timing: action=process_sync_group_streaming group={} slot={} processed_changes={} fetched_messages={} elapsed_ms={:.3}",
             group.name,
             group.slot_name,
@@ -447,8 +447,8 @@ async fn process_wal_messages(
                                     mapping.target_table.replace('"', "\"\"")
                                 );
                                 if let Err(e) = client.execute(&delete_sql, &[]).await {
-                                    eprintln!(
-                                        "Failed to clear target table {}.{}: {}",
+                                    tracing::error!(
+                                        "pg_duckpipe: failed to clear target table {}.{}: {}",
                                         mapping.target_schema, mapping.target_table, e
                                     );
                                 }
@@ -469,7 +469,7 @@ async fn process_wal_messages(
     // so any Success result here means PG is already up-to-date for that table.
     for r in &coordinator.collect_results() {
         if let FlushThreadResult::Error { target_key, error, mapping_id, .. } = r {
-            eprintln!("pg_duckpipe: flush error for {}: {}", target_key, error);
+            tracing::error!("pg_duckpipe: flush error for {}: {}", target_key, error);
             // Invalidate the cached mapping so the next WAL event for this table
             // re-fetches state from PG — it may have transitioned to ERRORED.
             for cached in rel_cache.values_mut() {
@@ -485,12 +485,12 @@ async fn process_wal_messages(
     if let Ok(retryable) = meta.get_retryable_errored_tables(group.id).await {
         for table in &retryable {
             if let Err(e) = meta.retry_errored_table(table.id).await {
-                eprintln!(
+                tracing::error!(
                     "pg_duckpipe: failed to retry errored table {}.{}: {}",
                     table.source_schema, table.source_table, e
                 );
             } else {
-                eprintln!(
+                tracing::info!(
                     "pg_duckpipe: auto-retrying errored table {}.{}",
                     table.source_schema, table.source_table
                 );
@@ -794,7 +794,7 @@ pub async fn run_sync_cycle(
         let prev_results = coordinator.collect_results();
         for r in &prev_results {
             if let FlushThreadResult::Error { target_key, error, .. } = r {
-                eprintln!("pg_duckpipe: flush error for {}: {}", target_key, error);
+                tracing::error!("pg_duckpipe: flush error for {}: {}", target_key, error);
             }
         }
 
@@ -805,7 +805,7 @@ pub async fn run_sync_cycle(
         if fresh_flushed > group.confirmed_lsn {
             group.confirmed_lsn = fresh_flushed;
             if let Err(e) = meta.update_confirmed_lsn(group.id, fresh_flushed).await {
-                eprintln!("pg_duckpipe: failed to persist confirmed_lsn for group {}: {}", group.id, e);
+                tracing::error!("pg_duckpipe: failed to persist confirmed_lsn for group {}: {}", group.id, e);
             }
         }
 
@@ -874,7 +874,7 @@ pub async fn run_sync_cycle(
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "pg_duckpipe: periodic enabled/state refresh failed for slot {}: {}",
                             group.slot_name, e
                         );
