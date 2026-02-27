@@ -562,12 +562,32 @@ fn flush_thread_main(
                 return;
             }
 
-            // Drain new changes from the shared queue into local accumulator
+            // Drain up to `batch_threshold` changes from the shared queue into
+            // the local accumulator.
+            //
+            // Capping the drain is critical for progress visibility: when the
+            // WAL consumer has queued a large backlog (e.g. 200k catch-up
+            // changes), draining all at once produces one monolithic DuckDB
+            // transaction that takes 25+ seconds with no intermediate commits.
+            // The benchmark (and any monitoring query) sees 0 rows/s until the
+            // transaction commits, then a sudden jump.  With a per-drain cap of
+            // `batch_threshold`, large queues are processed in chunks: each
+            // chunk flushes independently, commits, and becomes immediately
+            // visible in DuckLake.
+            //
+            // LSN safety: `accumulated_lsn` is derived from the drained
+            // changes only (max of their per-change `.lsn`).  We must NOT use
+            // `guard.last_lsn` here because that reflects the last change in
+            // the *entire* queue — setting applied_lsn past unflushed changes
+            // would be crash-unsafe (slot could advance past un-flushed WAL).
             if !guard.changes.is_empty() {
-                let count = guard.changes.len() as i64;
-                let changes = std::mem::take(&mut guard.changes);
-                if guard.last_lsn > accumulated_lsn {
-                    accumulated_lsn = guard.last_lsn;
+                let drain_n = guard.changes.len().min(batch_threshold);
+                let changes: Vec<Change> = guard.changes.drain(..drain_n).collect();
+                let count = changes.len() as i64;
+                // Max LSN across drained changes (WAL is ordered, so last = max).
+                let drained_lsn = changes.last().map(|c| c.lsn).unwrap_or(0);
+                if drained_lsn > accumulated_lsn {
+                    accumulated_lsn = drained_lsn;
                 }
                 if accumulated_meta.is_none() {
                     accumulated_meta = Some(guard.meta.clone());

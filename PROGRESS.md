@@ -67,6 +67,7 @@
 - [x] Catch-up rate displayed as cumulative average (falls during stalls, misleading) — fixed to windowed per-interval rate
 - [x] Final `lag_bytes` misleading after OLTP — WAL keeps advancing from checkpoints/autovacuum, lag stays large even when all DML is applied; fixed summary output to clarify
 - [x] Snapshot monitor `Pending: N` label misleading — N is the count of tables NOT in STREAMING state, not a queued-change count; renamed to `non-STREAMING: N`
+- [x] Catch-up shows no progress then sudden jump — flush thread drained entire 200k-change backlog into local accumulator in one shot, producing one monolithic 25s DuckDB transaction; fixed by capping per-drain at `batch_threshold` so each chunk flushes independently and is immediately visible in DuckLake
 
 ### Phase 7: Standardized Logging
 - `duckpipe-core/src/log.rs` (new) — `init_subscriber(debug: bool)`: shared tracing-subscriber setup; `RUST_LOG` overrides the default filter
