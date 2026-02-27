@@ -36,7 +36,7 @@ log_min_messages = warning
 duckdb.unsafe_allow_mixed_transactions=on
 duckpipe.debug_log=on
 duckpipe.flush_batch_threshold=10000
-duckpipe.data_inlining_row_limit=100000
+duckpipe.data_inlining_row_limit=1000
 # Longer poll cycle so WAL scan overhead doesn't crowd out data delivery.
 # Each cycle gets poll_interval/2 ms to read WAL; with large backlogs the server
 # needs several hundred ms just to scan past restart_lsn before it can stream new data.
