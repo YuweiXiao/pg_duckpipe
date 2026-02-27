@@ -38,15 +38,46 @@
 - [ ] Batch compaction tuning — reduce Parquet file proliferation under sustained small-batch writes
 - [ ] Inline data flush
 - [ ] Parquet-over-PG write throughput — ~10k rows/sec cap; bottleneck for large catch-up batches
+- [ ] WAL consumer: merge `poll_messages` + `process_wal_messages` into a single inline streaming loop
+
+  **Background:** The WAL consumer is split into two sequential stages per cycle:
+  (1) `poll_messages` — buffers up to `batch_size_per_group` (default 100k) pgoutput messages
+  into a `Vec`, blocking for ~3.3s at 10k TPS before returning anything.
+  (2) `process_wal_messages` — decodes the buffered `Vec` and calls `push_change` for each row.
+
+  This "collect-all-then-process" design means the flush coordinator queue receives rows in
+  bursts (33k rows every ~3.3s) rather than as a continuous ~10k rows/sec trickle. The burst
+  pattern produces irregular Parquet file sizes: with `flush_batch_threshold=10000` and
+  `oltp_insert` (3 pgoutput messages per txn: BEGIN+INSERT+COMMIT), each burst delivers exactly
+  `floor(100000/3) = 33333` rows → three 10k size-triggered flushes + one 3333-row
+  time-triggered flush. The trailing 1-row flush (observed in benchmarks) is the straddle
+  effect: since `100000 mod 3 = 1`, every cycle ends with a dangling BEGIN; the next cycle's
+  first decoded row is isolated by the time-trigger (flush_interval=1s << poll cycle=3.3s).
+
+  **Why the design exists today:**
+  - `resolve_mapping` / `ensure_coordinator_queue` are async PG queries; without restructuring
+    the borrow graph they can't easily be `.await`-ed inside a live `recv()` loop.
+  - Per-cycle metadata ops (`seed_table_lsns`, `transition_catchup_to_streaming`,
+    `update_worker_state`, `collect_results`) are naturally amortized at batch boundaries.
+  - Crash-safe `confirmed_lsn` snapshot (min of all tables' applied_lsn) is computed cleanly
+    once per batch; mid-stream checkpointing requires more careful LSN bookkeeping.
+
+  **Refactor approach:** Inline decode+dispatch inside the `recv()` loop; keep a single
+  hot path of `recv → decode → push_change` with no intermediate Vec. Move the bookkeeping
+  (LSN checkpoint, worker-state update, CATCHUP→STREAMING transition) to a periodic heartbeat
+  triggered by elapsed time or COMMIT count rather than batch boundaries.
+  `batch_size_per_group` becomes a max-messages-before-checkpoint limit, not a delivery buffer.
 
 ### Features
 - [ ] `source_uri` column for pg_mooncake compatibility
 - [ ] `conninfo` column in sync_groups for remote PG support
 - [ ] Schema DDL sync (ALTER TABLE ADD/DROP COLUMN propagation)
+- [ ] **`REPLICA IDENTITY FULL` opt-in** — Per-table option to issue `ALTER TABLE <src> REPLICA IDENTITY FULL` on add. Eliminates TOAST unchanged columns from WAL, removing the correlated-UPDATE resolution step in `duckdb_flush.rs` and the `col_unchanged` bookkeeping on `Change`. Trade-off: higher WAL volume on source.
 
 ### Monitoring / Observability
 - [ ] `applied_lsn` stays NULL during SNAPSHOT/CATCHUP — should be set to `snapshot_lsn` after snapshot completes
 - [ ] `worker_state` not updated during snapshot processing — stale metrics while snapshots run
+- [ ] A script for parsing perf log from benchmark and generate readable output
 
 ### Robustness
 - [ ] Snapshot failures have no retry backoff — risk of thrash on repeated failures

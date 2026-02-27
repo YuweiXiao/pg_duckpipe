@@ -217,6 +217,7 @@ impl FlushWorker {
         let target_table = parts[1];
 
         // Discover lake table info on first call or when cache is empty
+        let t_phase = Instant::now();
         if self.lake_info.is_none() {
             self.lake_info = Some(discover_lake_table_info(
                 &self.db,
@@ -226,6 +227,7 @@ impl FlushWorker {
             )?);
         }
         let lake_info = self.lake_info.as_ref().unwrap();
+        let t_discover_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Build buffer table schema:
         // seq INTEGER, op_type INTEGER (0=INSERT, 1=UPDATE, 2=DELETE),
@@ -249,11 +251,14 @@ impl FlushWorker {
         }
 
         let create_buf = format!("CREATE TABLE buffer ({})", buf_cols.join(", "));
+        let t_phase = Instant::now();
         self.db
             .execute_batch(&create_buf)
             .map_err(|e| format!("duckdb create buffer: {}", e))?;
+        let t_buf_create_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Load changes into buffer using DuckDB Appender (bypasses SQL parsing).
+        let t_phase = Instant::now();
         let ncols = attnames.len();
         let mut seq: i32 = 0;
 
@@ -312,6 +317,7 @@ impl FlushWorker {
                 .flush()
                 .map_err(|e| format!("duckdb appender flush: {}", e))?;
         }
+        let t_load_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Build PK column list for compact and MERGE
         let pk_cols: Vec<String> = key_attrs
@@ -319,6 +325,7 @@ impl FlushWorker {
             .map(|&i| format!("\"{}\"", attnames[i].replace('"', "\"\"")))
             .collect();
         // Step 1: Compact — deduplicate by PK, keep last operation (highest seq).
+        let t_phase = Instant::now();
         let compact_sql = format!(
             "CREATE TEMP TABLE compacted AS \
              SELECT * EXCLUDE (_rn) FROM ( \
@@ -330,6 +337,7 @@ impl FlushWorker {
         self.db
             .execute_batch(&compact_sql)
             .map_err(|e| format!("duckdb compact: {}", e))?;
+        let t_compact_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Step 2: Apply changes to DuckLake target using separate DML statements.
         let target_ref = format!(
@@ -344,6 +352,7 @@ impl FlushWorker {
             .collect();
 
         // Step 2a: Resolve TOAST unchanged columns BEFORE deleting old rows.
+        let t_phase = Instant::now();
         let has_any_unchanged = changes
             .iter()
             .any(|c| c.col_unchanged.iter().any(|&u| u));
@@ -377,11 +386,14 @@ impl FlushWorker {
                     .map_err(|e| format!("duckdb resolve toast {}: {}", name, e))?;
             }
         }
+        let t_toast_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Wrap DELETE+INSERT in a transaction for atomicity.
+        let t_phase = Instant::now();
         self.db
             .execute_batch("BEGIN")
             .map_err(|e| format!("duckdb begin: {}", e))?;
+        let t_begin_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Step 2b: DELETE — remove rows from target that match any compacted row's PK.
         //
@@ -413,6 +425,7 @@ impl FlushWorker {
             pk_match = pk_where.join(" AND ")
         );
 
+        let t_phase = Instant::now();
         let deleted_count: usize = if skip_delete {
             0
         } else {
@@ -423,6 +436,7 @@ impl FlushWorker {
                     format!("duckdb delete from {}: {}", target_key, e)
                 })?
         };
+        let t_delete_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // If this was a pure-insert batch and DELETE matched nothing, the
         // WAL-replay conflict window is over — clear the flag so future
@@ -432,6 +446,7 @@ impl FlushWorker {
         }
 
         // Step 2c: INSERT — re-insert rows for INSERT and UPDATE ops.
+        let t_phase = Instant::now();
         let insert_sql = format!(
             "INSERT INTO {target_ref} ({cols}) \
              SELECT {cols} FROM compacted WHERE _op_type IN (0, 1)",
@@ -444,16 +459,40 @@ impl FlushWorker {
                 let _ = self.db.execute_batch("ROLLBACK");
                 format!("duckdb insert into {}: {}", target_key, e)
             })?;
+        let t_insert_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
+        let t_phase = Instant::now();
         self.db
             .execute_batch("COMMIT")
             .map_err(|e| format!("duckdb commit: {}", e))?;
+        let t_commit_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
         // Cleanup
+        let t_phase = Instant::now();
         self.db
             .execute_batch("DROP TABLE IF EXISTS compacted; DROP TABLE IF EXISTS buffer;")
             .map_err(|e| format!("duckdb cleanup: {}", e))?;
+        let t_cleanup_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
+        tracing::debug!(
+            "DuckPipe perf: action=duckdb_flush target={} rows={} \
+             discover_ms={:.1} buf_create_ms={:.1} load_ms={:.1} compact_ms={:.1} \
+             toast_ms={:.1} begin_ms={:.1} delete_ms={:.1} insert_ms={:.1} \
+             commit_ms={:.1} cleanup_ms={:.1} total_ms={:.1}",
+            target_key,
+            applied_count,
+            t_discover_ms,
+            t_buf_create_ms,
+            t_load_ms,
+            t_compact_ms,
+            t_toast_ms,
+            t_begin_ms,
+            t_delete_ms,
+            t_insert_ms,
+            t_commit_ms,
+            t_cleanup_ms,
+            flush_start.elapsed().as_secs_f64() * 1000.0,
+        );
         tracing::info!(
             "DuckPipe timing: action=duckdb_flush target={} rows={} has_non_inserts={} \
              skip_delete={} deleted={} may_have_conflicts={} elapsed_ms={:.1}",
