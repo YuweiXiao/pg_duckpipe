@@ -537,25 +537,10 @@ fn flush_thread_main(
 
             // Check shutdown
             if control.shutdown.load(Ordering::Acquire) {
-                // Flush any accumulated changes before exit
-                if !accumulated.is_empty() {
-                    if let Some(meta) = accumulated_meta.as_ref() {
-                        do_flush(
-                            &mut worker,
-                            &mut accumulated,
-                            accumulated_lsn,
-                            meta,
-                            pg_connstr,
-                            ducklake_schema,
-                            &result_tx,
-                            &rt,
-                        );
-                    }
-                    accumulated.clear();
-                    backpressure.total_queued.fetch_sub(accumulated_count, Ordering::Relaxed);
-                    pending_local.store(0, Ordering::Relaxed);
-                }
-                // Signal drain_complete if requested
+                // Drop in-memory changes — confirmed_lsn was never advanced past them,
+                // so PostgreSQL will re-deliver them on the next startup.
+                backpressure.total_queued.fetch_sub(accumulated_count, Ordering::Relaxed);
+                pending_local.store(0, Ordering::Relaxed);
                 if control.drain_requested.load(Ordering::Acquire) {
                     signal_drain_complete(&drain_complete, &control);
                 }

@@ -1,0 +1,48 @@
+-- Test: rows inserted just before stop_worker are safely re-delivered on restart.
+--
+-- The flush thread drops its in-memory accumulator on shutdown; confirmed_lsn is
+-- not advanced past unflushed changes, so PostgreSQL re-delivers them when the
+-- worker reconnects.  All three outcomes are safe:
+--   A) rows still in accumulator  -> dropped, re-delivered on restart
+--   B) rows not yet consumed      -> re-delivered on restart
+--   C) rows already flushed       -> restart is idempotent (upsert semantics)
+SET client_min_messages = warning;
+SELECT duckpipe.start_worker();
+RESET client_min_messages;
+
+CREATE TABLE shutdown_test (id int primary key, val text);
+
+-- copy_data=false: skip snapshot, enter STREAMING immediately
+SELECT duckpipe.add_table('public.shutdown_test', NULL, 'default', false);
+
+SELECT pg_sleep(1);
+
+-- Insert rows while the worker is running; they will be decoded from WAL
+-- and may or may not have been flushed when stop_worker fires.
+INSERT INTO shutdown_test VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+-- Stop immediately — any rows still in the flush thread's in-memory
+-- accumulator are dropped.  confirmed_lsn stays below these rows' LSNs.
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
+RESET client_min_messages;
+
+-- Restart — reconnects from confirmed_lsn and re-delivers any dropped rows.
+SET client_min_messages = warning;
+SELECT duckpipe.start_worker();
+RESET client_min_messages;
+
+-- Allow time for reconnect, re-delivery, and flush.
+SELECT pg_sleep(4);
+
+-- All rows must be present regardless of which path was taken.
+SELECT * FROM public.shutdown_test_ducklake ORDER BY id;
+
+-- Cleanup
+SELECT duckpipe.remove_table('public.shutdown_test', false);
+DROP TABLE public.shutdown_test_ducklake;
+DROP TABLE shutdown_test;
+
+SET client_min_messages = warning;
+SELECT duckpipe.stop_worker();
+RESET client_min_messages;
