@@ -73,6 +73,7 @@
 - [ ] `conninfo` column in sync_groups for remote PG support
 - [ ] Schema DDL sync (ALTER TABLE ADD/DROP COLUMN propagation)
 - [ ] **`REPLICA IDENTITY FULL` opt-in** — Per-table option to issue `ALTER TABLE <src> REPLICA IDENTITY FULL` on add. Eliminates TOAST unchanged columns from WAL, removing the correlated-UPDATE resolution step in `duckdb_flush.rs` and the `col_unchanged` bookkeeping on `Change`. Trade-off: higher WAL volume on source.
+- [ ] Dockerfile for setting up a self-contained playground env
 
 ### Monitoring / Observability
 - [ ] `applied_lsn` stays NULL during SNAPSHOT/CATCHUP — should be set to `snapshot_lsn` after snapshot completes
