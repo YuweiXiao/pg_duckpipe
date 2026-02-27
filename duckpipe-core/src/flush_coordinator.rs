@@ -626,6 +626,9 @@ fn flush_thread_main(
             accumulated_count = 0;
             pending_local.store(0, Ordering::Relaxed);
             accumulated_lsn = 0;
+            // Reset from AFTER flush completion, not before. This gives a
+            // cooldown of flush_interval between flushes. Under a slow flush,
+            // the next trigger comes from batch_threshold, not the timer.
             last_flush = Instant::now();
         }
 
