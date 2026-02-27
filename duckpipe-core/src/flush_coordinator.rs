@@ -58,6 +58,12 @@ struct FlushThreadEntry {
     control: Arc<ThreadControl>,
     join_handle: Option<JoinHandle<()>>,
     drain_complete: Arc<(Mutex<bool>, Condvar)>,
+    /// Count of changes currently held in the flush thread's local accumulator.
+    /// Updated atomically by the flush thread after each drain / flush / clear.
+    /// Relaxed ordering is sufficient — the coordinator reads this only for diagnostics.
+    pending_local: Arc<AtomicI64>,
+    /// Mapping ID, cached here so table_pending_counts() doesn't need to lock the queue.
+    mapping_id: i32,
 }
 
 /// Result sent from flush thread to main thread via mpsc channel.
@@ -204,11 +210,13 @@ impl FlushCoordinator {
         });
 
         let drain_complete = Arc::new((Mutex::new(false), Condvar::new()));
+        let pending_local = Arc::new(AtomicI64::new(0));
 
         // Clone Arcs for the thread
         let qh = Arc::clone(&queue_handle);
         let ctrl = Arc::clone(&control);
         let dc = Arc::clone(&drain_complete);
+        let pl = Arc::clone(&pending_local);
         let tx = self.result_tx.clone();
         let pg_connstr = self.pg_connstr.clone();
         let ducklake_schema = self.ducklake_schema.clone();
@@ -223,6 +231,7 @@ impl FlushCoordinator {
                     qh,
                     ctrl,
                     dc,
+                    pl,
                     tx,
                     &pg_connstr,
                     &ducklake_schema,
@@ -240,6 +249,8 @@ impl FlushCoordinator {
                 control,
                 join_handle: Some(join_handle),
                 drain_complete,
+                pending_local,
+                mapping_id,
             },
         );
     }
@@ -266,6 +277,22 @@ impl FlushCoordinator {
     /// Get the current total queued changes count (for observability).
     pub fn total_queued(&self) -> i64 {
         self.backpressure.total_queued.load(Ordering::Relaxed)
+    }
+
+    /// Return per-table pending change counts as `(mapping_id, queued_changes)`.
+    ///
+    /// `queued_changes` = changes in the shared queue (not yet drained by the flush thread)
+    /// + changes in the flush thread's local accumulator (drained but not yet flushed).
+    /// Both components are best-effort (Relaxed ordering); suitable for diagnostics only.
+    pub fn table_pending_counts(&self) -> Vec<(i32, i64)> {
+        self.threads
+            .values()
+            .map(|entry| {
+                let shared = entry.queue_handle.inner.lock().unwrap().changes.len() as i64;
+                let local = entry.pending_local.load(Ordering::Relaxed);
+                (entry.mapping_id, shared + local)
+            })
+            .collect()
     }
 
     /// Compute the minimum applied LSN across all tables tracked in `per_table_lsn`.
@@ -446,6 +473,7 @@ fn flush_thread_main(
     queue_handle: Arc<TableQueueHandle>,
     control: Arc<ThreadControl>,
     drain_complete: Arc<(Mutex<bool>, Condvar)>,
+    pending_local: Arc<AtomicI64>,
     result_tx: mpsc::Sender<FlushThreadResult>,
     pg_connstr: &str,
     ducklake_schema: &str,
@@ -518,6 +546,7 @@ fn flush_thread_main(
                     }
                     accumulated.clear();
                     backpressure.total_queued.fetch_sub(accumulated_count, Ordering::Relaxed);
+                    pending_local.store(0, Ordering::Relaxed);
                 }
                 // Signal drain_complete if requested
                 if control.drain_requested.load(Ordering::Acquire) {
@@ -540,6 +569,9 @@ fn flush_thread_main(
 
                 accumulated.extend(changes);
                 accumulated_count += count;
+                // Update local-accumulator counter so the coordinator can read it
+                // without locking.  Relaxed ordering is fine for diagnostics.
+                pending_local.store(accumulated_count, Ordering::Relaxed);
                 // Note: backpressure counter is NOT decremented here.
                 // It is decremented after flush/clear to accurately reflect
                 // all in-flight data (shared queues + local accumulators).
@@ -580,6 +612,7 @@ fn flush_thread_main(
             accumulated.clear();
             backpressure.total_queued.fetch_sub(accumulated_count, Ordering::Relaxed);
             accumulated_count = 0;
+            pending_local.store(0, Ordering::Relaxed);
             accumulated_lsn = 0;
             last_flush = Instant::now();
         }

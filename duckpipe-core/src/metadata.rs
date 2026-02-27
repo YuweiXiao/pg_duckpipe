@@ -570,6 +570,26 @@ impl<'a> MetadataClient<'a> {
         Ok(())
     }
 
+    /// Update per-table queued_changes (called once per sync cycle for observability).
+    ///
+    /// Sets `queued_changes` on each row to the current in-flight change count
+    /// (shared queue + local accumulator).  Best-effort — errors are logged but
+    /// not propagated, as this is purely diagnostic.
+    pub async fn update_table_queued_changes(
+        &self,
+        counts: &[(i32, i64)],
+    ) -> Result<(), tokio_postgres::Error> {
+        for &(mapping_id, count) in counts {
+            self.client
+                .execute(
+                    "UPDATE duckpipe.table_mappings SET queued_changes = $1 WHERE id = $2",
+                    &[&count, &mapping_id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Update worker runtime state (called once per sync cycle for observability).
     pub async fn update_worker_state(
         &self,

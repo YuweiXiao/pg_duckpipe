@@ -31,6 +31,7 @@
 - [x] 19 regression tests all passing
 - [x] Observability: `status()` SRF exposes `consecutive_failures`, `retry_at`, `applied_lsn` per table
 - [x] Observability: `worker_status()` SRF exposes runtime `total_queued_changes`, `is_backpressured`
+- [x] Observability: `status()` SRF now exposes `queued_changes` per table (shared queue + flush thread local accumulator)
 
 ### TODO
 
@@ -49,7 +50,7 @@
 #### Monitoring / Observability
 - [x] `rows_synced` = 0 during snapshot — snapshot row count not credited to `rows_synced`; fixed by returning row count from `process_snapshot_task()` and calling `update_table_metrics()` after `set_catchup_state()`
 - [ ] `applied_lsn` stays NULL during SNAPSHOT/CATCHUP until first WAL flush — should be set to `snapshot_lsn` after snapshot completes
-- [ ] No per-table accumulator visibility — operators cannot see how many changes are buffered per-table (only aggregate `total_queued_changes`)
+- [x] No per-table accumulator visibility — fixed: `table_mappings.queued_changes` updated each cycle from `coordinator.table_pending_counts()` (shared queue + local accumulator); exposed in `duckpipe.status()` as `queued_changes BIGINT`
 - [ ] `worker_state` not updated during snapshot processing — stale `total_queued_changes`/`is_backpressured` while snapshots run
 
 #### Robustness

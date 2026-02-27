@@ -915,6 +915,12 @@ pub async fn run_sync_cycle(
         .update_worker_state(coordinator.total_queued(), coordinator.is_backpressured())
         .await;
 
+    // Update per-table queued_changes for per-table accumulator visibility
+    let pending_counts = coordinator.table_pending_counts();
+    if !pending_counts.is_empty() {
+        let _ = meta.update_table_queued_changes(&pending_counts).await;
+    }
+
     // Clean up metadata connection
     drop(client);
     let _ = conn_handle.await;

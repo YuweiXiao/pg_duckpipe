@@ -822,6 +822,7 @@ CREATE FUNCTION duckpipe.status() RETURNS TABLE(
     state TEXT,
     enabled BOOLEAN,
     rows_synced BIGINT,
+    queued_changes BIGINT,
     last_sync TIMESTAMPTZ,
     error_message TEXT,
     consecutive_failures INTEGER,
@@ -840,6 +841,7 @@ fn status() -> TableIterator<
         name!(state, String),
         name!(enabled, bool),
         name!(rows_synced, i64),
+        name!(queued_changes, i64),
         name!(last_sync, Option<TimestampWithTimeZone>),
         name!(error_message, Option<String>),
         name!(consecutive_failures, i32),
@@ -854,8 +856,8 @@ fn status() -> TableIterator<
             "SELECT g.name as sync_group, \
              m.source_schema || '.' || m.source_table as source_table, \
              m.target_schema || '.' || m.target_table as target_table, \
-             m.state, m.enabled, m.rows_synced, m.last_sync_at, m.error_message, \
-             m.consecutive_failures, m.retry_at, m.applied_lsn::text \
+             m.state, m.enabled, m.rows_synced, m.queued_changes, m.last_sync_at, \
+             m.error_message, m.consecutive_failures, m.retry_at, m.applied_lsn::text \
              FROM duckpipe.table_mappings m \
              JOIN duckpipe.sync_groups g ON m.group_id = g.id \
              ORDER BY g.name, m.source_schema, m.source_table",
@@ -871,11 +873,12 @@ fn status() -> TableIterator<
                 let state: String = row.get(4).unwrap().unwrap();
                 let enabled: bool = row.get(5).unwrap().unwrap();
                 let rows_synced: i64 = row.get(6).unwrap().unwrap();
-                let last_sync: Option<TimestampWithTimeZone> = row.get(7).unwrap();
-                let error_message: Option<String> = row.get(8).unwrap();
-                let consecutive_failures: i32 = row.get::<i32>(9).unwrap().unwrap_or(0);
-                let retry_at: Option<TimestampWithTimeZone> = row.get(10).unwrap();
-                let applied_lsn: Option<String> = row.get(11).unwrap();
+                let queued_changes: i64 = row.get::<i64>(7).unwrap().unwrap_or(0);
+                let last_sync: Option<TimestampWithTimeZone> = row.get(8).unwrap();
+                let error_message: Option<String> = row.get(9).unwrap();
+                let consecutive_failures: i32 = row.get::<i32>(10).unwrap().unwrap_or(0);
+                let retry_at: Option<TimestampWithTimeZone> = row.get(11).unwrap();
+                let applied_lsn: Option<String> = row.get(12).unwrap();
 
                 rows.push((
                     sync_group,
@@ -884,6 +887,7 @@ fn status() -> TableIterator<
                     state,
                     enabled,
                     rows_synced,
+                    queued_changes,
                     last_sync,
                     error_message,
                     consecutive_failures,
