@@ -49,6 +49,11 @@ pub struct ServiceConfig {
 /// without adding per-round metadata queries.
 const ENABLED_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Heartbeat triggers: bookkeeping (flush results, auto-retry, CATCHUP→STREAMING,
+/// confirmed_lsn update) runs every N commits OR every T ms, whichever comes first.
+const HEARTBEAT_COMMITS: u32 = 10_000;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Result of processing one sync group round.
 pub struct ProcessResult {
     pub total_processed: i32,
@@ -102,174 +107,137 @@ async fn ensure_coordinator_queue(
     Ok(())
 }
 
-/// Process one sync group using streaming replication for WAL consumption.
+/// Decode and dispatch a single pgoutput WAL message to the flush coordinator.
 ///
-/// Reads WAL via `SlotConsumer` (START_REPLICATION protocol), decodes, dispatches,
-/// flushes, and sends StandbyStatusUpdate. Near-zero latency.
-async fn process_sync_group_streaming(
+/// Returns `true` if the message was a COMMIT (used by the caller to trigger
+/// periodic heartbeats). All other message types return `false`.
+async fn process_one_wal_message(
     client: &Client,
     meta: &MetadataClient<'_>,
     group: &mut SyncGroup,
-    config: &ServiceConfig,
-    consumer: &mut SlotConsumer,
+    lsn: u64,
+    data: &[u8],
     coordinator: &mut FlushCoordinator,
     rel_cache: &mut HashMap<u32, RelCacheWithMapping>,
-) -> Result<ProcessResult, String> {
-    let timing = config.debug_log;
-    let group_start = if timing { Some(Instant::now()) } else { None };
+) -> Result<bool, String> {
+    if data.is_empty() {
+        return Ok(false);
+    }
 
-    // Check backpressure — if flush threads are lagging behind, skip this poll round
-    if coordinator.is_backpressured() {
-        // Still compute confirmed_lsn and advance slot even when backpressured.
-        // Prefer in-memory state (consistent with the main confirmed_lsn path);
-        // fall back to PG query when coordinator has no tables yet.
-        let min_lsn = {
-            let in_mem = coordinator.get_min_applied_lsn_in_coordinator();
-            if in_mem > 0 {
-                in_mem
-            } else {
-                meta.get_min_applied_lsn(group.id).await.unwrap_or(0)
-            }
-        };
-        if min_lsn > 0 {
-            let _ = meta.update_confirmed_lsn(group.id, min_lsn).await;
-            consumer.send_status_update(min_lsn);
+    let mut cursor: usize = 0;
+    let msgtype = read_byte(data, &mut cursor) as char;
+
+    match msgtype {
+        'R' => {
+            let (rel_id, entry) = parse_relation_message(data, &mut cursor);
+            rel_cache.insert(rel_id, RelCacheWithMapping { entry, mapping: None });
         }
-        return Ok(ProcessResult {
-            total_processed: 0,
-            any_work: false,
-            confirmed_lsn: min_lsn,
-        });
-    }
+        'I' => {
+            let rel_id = read_i32(data, &mut cursor) as u32;
+            let _new_marker = read_byte(data, &mut cursor);
+            let atttypes = rel_cache
+                .get(&rel_id)
+                .map(|c| c.entry.atttypes.as_slice())
+                .unwrap_or(&[]);
+            let (values, _unchanged) = parse_tuple_data(data, &mut cursor, atttypes);
 
-    // Poll for WAL messages from the streaming consumer.
-    // Wait up to poll_interval for the first message, then drain quickly.
-    let timeout_ms = (config.poll_interval_ms / 2).max(100) as u64;
-    let wal_messages = consumer
-        .poll_messages(config.batch_size_per_group, timeout_ms)
-        .await?;
-
-    if wal_messages.is_empty() {
-        // No new WAL, but flush threads may have advanced confirmed_lsn since the
-        // last StandbyStatusUpdate (e.g. during catch-up after bulk OLTP ends).
-        // Send an update so the slot's confirmed_flush_lsn — and therefore lag_bytes
-        // in duckpipe.groups() — reflects flush progress each cycle.
-        let min_lsn = coordinator.get_min_applied_lsn_in_coordinator();
-        if min_lsn > 0 {
-            consumer.send_status_update(min_lsn);
-        }
-        return Ok(ProcessResult {
-            total_processed: 0,
-            any_work: false,
-            confirmed_lsn: min_lsn,
-        });
-    }
-
-    let num_messages = wal_messages.len();
-
-    // Process the WAL messages (shared logic)
-    let result =
-        process_wal_messages(client, meta, group, &wal_messages, coordinator, rel_cache).await?;
-
-    // Send StandbyStatusUpdate to advance the replication slot.
-    // With streaming, we explicitly control slot advancement (unlike SQL polling
-    // which advances automatically). Use the crash-safe confirmed_lsn
-    // (min of applied_lsn across all active tables) rather than pending_lsn,
-    // so the slot is only advanced to the point all tables have durably flushed.
-    if result.confirmed_lsn != 0 {
-        consumer.send_status_update(result.confirmed_lsn);
-    }
-
-    if let Some(start) = group_start {
-        tracing::debug!(
-            "DuckPipe timing: action=process_sync_group_streaming group={} slot={} processed_changes={} fetched_messages={} elapsed_ms={:.3}",
-            group.name,
-            group.slot_name,
-            result.total_processed,
-            num_messages,
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-
-    Ok(result)
-}
-
-/// Core WAL message processing: decode pgoutput binary messages, dispatch to
-/// per-table queues via FlushCoordinator, drain+flush at cycle end,
-/// transition CATCHUP → STREAMING, update confirmed_lsn.
-async fn process_wal_messages(
-    client: &Client,
-    meta: &MetadataClient<'_>,
-    group: &mut SyncGroup,
-    wal_messages: &[(u64, Vec<u8>)],
-    coordinator: &mut FlushCoordinator,
-    rel_cache: &mut HashMap<u32, RelCacheWithMapping>,
-) -> Result<ProcessResult, String> {
-    let mut total_processed: i32 = 0;
-
-    for (lsn, data) in wal_messages.iter() {
-        if data.is_empty() {
-            continue;
-        }
-
-        let mut cursor: usize = 0;
-        let msgtype = read_byte(data, &mut cursor) as char;
-
-        match msgtype {
-            'R' => {
-                let (rel_id, entry) = parse_relation_message(data, &mut cursor);
-                rel_cache.insert(
-                    rel_id,
-                    RelCacheWithMapping {
-                        entry,
-                        mapping: None,
-                    },
-                );
-            }
-            'I' => {
-                let rel_id = read_i32(data, &mut cursor) as u32;
-                let _new_marker = read_byte(data, &mut cursor);
-                let atttypes = rel_cache
-                    .get(&rel_id)
-                    .map(|c| c.entry.atttypes.as_slice())
-                    .unwrap_or(&[]);
-                let (values, _unchanged) = parse_tuple_data(data, &mut cursor, atttypes);
-
-                if let Some(cached) = rel_cache.get_mut(&rel_id) {
-                    if cached.mapping.is_none() {
-                        cached.mapping =
-                            resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
+            if let Some(cached) = rel_cache.get_mut(&rel_id) {
+                if cached.mapping.is_none() {
+                    cached.mapping = resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
+                }
+                if let Some(ref mapping) = cached.mapping {
+                    if !mapping.enabled || mapping.state == "ERRORED" {
+                        return Ok(false);
                     }
-                    if let Some(ref mapping) = cached.mapping {
-                        if !mapping.enabled || mapping.state == "ERRORED" {
-                            total_processed += 1;
-                            continue;
-                        }
-                        if mapping.state == "CATCHUP"
-                            && mapping.snapshot_lsn != 0
-                            && *lsn <= mapping.snapshot_lsn
-                        {
-                            total_processed += 1;
-                            continue;
-                        }
-
-                        let target_key =
-                            format!("{}.{}", mapping.target_schema, mapping.target_table);
-                        ensure_coordinator_queue(
-                            coordinator,
-                            &target_key,
-                            mapping,
-                            &cached.entry,
-                            meta,
-                        )
+                    if mapping.state == "CATCHUP"
+                        && mapping.snapshot_lsn != 0
+                        && lsn <= mapping.snapshot_lsn
+                    {
+                        return Ok(false);
+                    }
+                    let target_key = format!("{}.{}", mapping.target_schema, mapping.target_table);
+                    ensure_coordinator_queue(coordinator, &target_key, mapping, &cached.entry, meta)
                         .await?;
+                    coordinator.push_change(
+                        &target_key,
+                        Change {
+                            change_type: ChangeType::Insert,
+                            lsn,
+                            col_values: values,
+                            key_values: Vec::new(),
+                            col_unchanged: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
+        'U' => {
+            let rel_id = read_i32(data, &mut cursor) as u32;
+            let atttypes = rel_cache
+                .get(&rel_id)
+                .map(|c| c.entry.atttypes.as_slice())
+                .unwrap_or(&[]);
+            let marker = read_byte(data, &mut cursor) as char;
+            let (old_values, has_old) = if marker == 'K' || marker == 'O' {
+                let (vals, _) = parse_tuple_data(data, &mut cursor, atttypes);
+                let _new_marker = read_byte(data, &mut cursor);
+                (vals, true)
+            } else {
+                (Vec::new(), false)
+            };
+            let (new_values, new_unchanged) = parse_tuple_data(data, &mut cursor, atttypes);
+            let has_unchanged = new_unchanged.iter().any(|&u| u);
 
+            if let Some(cached) = rel_cache.get_mut(&rel_id) {
+                if cached.mapping.is_none() {
+                    cached.mapping = resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
+                }
+                if let Some(ref mapping) = cached.mapping {
+                    if !mapping.enabled || mapping.state == "ERRORED" {
+                        return Ok(false);
+                    }
+                    if mapping.state == "CATCHUP"
+                        && mapping.snapshot_lsn != 0
+                        && lsn <= mapping.snapshot_lsn
+                    {
+                        return Ok(false);
+                    }
+                    let target_key = format!("{}.{}", mapping.target_schema, mapping.target_table);
+                    ensure_coordinator_queue(coordinator, &target_key, mapping, &cached.entry, meta)
+                        .await?;
+                    let key_values = if has_old {
+                        old_values
+                    } else {
+                        extract_key_values(&new_values, &cached.entry.attkeys)
+                    };
+                    if has_unchanged {
+                        coordinator.push_change(
+                            &target_key,
+                            Change {
+                                change_type: ChangeType::Update,
+                                lsn,
+                                col_values: new_values,
+                                key_values,
+                                col_unchanged: new_unchanged,
+                            },
+                        );
+                    } else {
+                        coordinator.push_change(
+                            &target_key,
+                            Change {
+                                change_type: ChangeType::Delete,
+                                lsn,
+                                col_values: Vec::new(),
+                                key_values: key_values.clone(),
+                                col_unchanged: Vec::new(),
+                            },
+                        );
                         coordinator.push_change(
                             &target_key,
                             Change {
                                 change_type: ChangeType::Insert,
-                                lsn: *lsn,
-                                col_values: values,
+                                lsn,
+                                col_values: new_values,
                                 key_values: Vec::new(),
                                 col_unchanged: Vec::new(),
                             },
@@ -277,209 +245,115 @@ async fn process_wal_messages(
                     }
                 }
             }
-            'U' => {
-                let rel_id = read_i32(data, &mut cursor) as u32;
-                let atttypes = rel_cache
-                    .get(&rel_id)
-                    .map(|c| c.entry.atttypes.as_slice())
-                    .unwrap_or(&[]);
-                let marker = read_byte(data, &mut cursor) as char;
-                let (old_values, has_old) = if marker == 'K' || marker == 'O' {
-                    let (vals, _) = parse_tuple_data(data, &mut cursor, atttypes);
-                    let _new_marker = read_byte(data, &mut cursor);
-                    (vals, true)
-                } else {
-                    (Vec::new(), false)
-                };
+        }
+        'D' => {
+            let rel_id = read_i32(data, &mut cursor) as u32;
+            let atttypes = rel_cache
+                .get(&rel_id)
+                .map(|c| c.entry.atttypes.as_slice())
+                .unwrap_or(&[]);
+            let _marker = read_byte(data, &mut cursor);
+            let (old_values, _) = parse_tuple_data(data, &mut cursor, atttypes);
 
-                let (new_values, new_unchanged) = parse_tuple_data(data, &mut cursor, atttypes);
-                let has_unchanged = new_unchanged.iter().any(|&u| u);
-
-                if let Some(cached) = rel_cache.get_mut(&rel_id) {
-                    if cached.mapping.is_none() {
-                        cached.mapping =
-                            resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
+            if let Some(cached) = rel_cache.get_mut(&rel_id) {
+                if cached.mapping.is_none() {
+                    cached.mapping = resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
+                }
+                if let Some(ref mapping) = cached.mapping {
+                    if !mapping.enabled || mapping.state == "ERRORED" {
+                        return Ok(false);
                     }
-                    if let Some(ref mapping) = cached.mapping {
-                        if !mapping.enabled || mapping.state == "ERRORED" {
-                            total_processed += 1;
-                            continue;
-                        }
-                        if mapping.state == "CATCHUP"
-                            && mapping.snapshot_lsn != 0
-                            && *lsn <= mapping.snapshot_lsn
-                        {
-                            total_processed += 1;
-                            continue;
-                        }
-
-                        let target_key =
-                            format!("{}.{}", mapping.target_schema, mapping.target_table);
-                        ensure_coordinator_queue(
-                            coordinator,
-                            &target_key,
-                            mapping,
-                            &cached.entry,
-                            meta,
-                        )
+                    if mapping.state == "CATCHUP"
+                        && mapping.snapshot_lsn != 0
+                        && lsn <= mapping.snapshot_lsn
+                    {
+                        return Ok(false);
+                    }
+                    let target_key = format!("{}.{}", mapping.target_schema, mapping.target_table);
+                    ensure_coordinator_queue(coordinator, &target_key, mapping, &cached.entry, meta)
                         .await?;
-
-                        let key_values = if has_old {
-                            old_values
-                        } else {
-                            extract_key_values(&new_values, &cached.entry.attkeys)
-                        };
-
-                        if has_unchanged {
-                            coordinator.push_change(
-                                &target_key,
-                                Change {
-                                    change_type: ChangeType::Update,
-                                    lsn: *lsn,
-                                    col_values: new_values,
-                                    key_values,
-                                    col_unchanged: new_unchanged,
-                                },
-                            );
-                        } else {
-                            coordinator.push_change(
-                                &target_key,
-                                Change {
-                                    change_type: ChangeType::Delete,
-                                    lsn: *lsn,
-                                    col_values: Vec::new(),
-                                    key_values: key_values.clone(),
-                                    col_unchanged: Vec::new(),
-                                },
-                            );
-                            coordinator.push_change(
-                                &target_key,
-                                Change {
-                                    change_type: ChangeType::Insert,
-                                    lsn: *lsn,
-                                    col_values: new_values,
-                                    key_values: Vec::new(),
-                                    col_unchanged: Vec::new(),
-                                },
-                            );
-                        }
-                    }
+                    coordinator.push_change(
+                        &target_key,
+                        Change {
+                            change_type: ChangeType::Delete,
+                            lsn,
+                            col_values: Vec::new(),
+                            key_values: old_values,
+                            col_unchanged: Vec::new(),
+                        },
+                    );
                 }
             }
-            'D' => {
+        }
+        'B' => {
+            let _final_lsn = read_i64(data, &mut cursor) as u64;
+            let _commit_time = read_i64(data, &mut cursor);
+            let _xid = read_i32(data, &mut cursor);
+        }
+        'C' => {
+            let _flags = read_byte(data, &mut cursor);
+            let _commit_lsn = read_i64(data, &mut cursor) as u64;
+            let end_lsn = read_i64(data, &mut cursor) as u64;
+            let _commit_time = read_i64(data, &mut cursor);
+            group.pending_lsn = end_lsn;
+            return Ok(true);
+        }
+        'T' => {
+            // TRUNCATE — flush per-table pending queues, then DELETE all from targets.
+            // Uses DELETE FROM instead of TRUNCATE because DuckLake tables
+            // (via pg_duckdb) silently ignore TRUNCATE — it succeeds but
+            // doesn't actually remove rows.
+            let nrels = read_i32(data, &mut cursor);
+            let _options = read_byte(data, &mut cursor);
+            for _ in 0..nrels {
                 let rel_id = read_i32(data, &mut cursor) as u32;
-                let atttypes = rel_cache
-                    .get(&rel_id)
-                    .map(|c| c.entry.atttypes.as_slice())
-                    .unwrap_or(&[]);
-                let _marker = read_byte(data, &mut cursor);
-                let (old_values, _) = parse_tuple_data(data, &mut cursor, atttypes);
-
-                if let Some(cached) = rel_cache.get_mut(&rel_id) {
-                    if cached.mapping.is_none() {
-                        cached.mapping =
-                            resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
-                    }
-                    if let Some(ref mapping) = cached.mapping {
-                        if !mapping.enabled || mapping.state == "ERRORED" {
-                            total_processed += 1;
-                            continue;
-                        }
-                        if mapping.state == "CATCHUP"
-                            && mapping.snapshot_lsn != 0
-                            && *lsn <= mapping.snapshot_lsn
-                        {
-                            total_processed += 1;
-                            continue;
-                        }
-
-                        let target_key =
-                            format!("{}.{}", mapping.target_schema, mapping.target_table);
-                        ensure_coordinator_queue(
-                            coordinator,
-                            &target_key,
-                            mapping,
-                            &cached.entry,
-                            meta,
-                        )
-                        .await?;
-
-                        coordinator.push_change(
-                            &target_key,
-                            Change {
-                                change_type: ChangeType::Delete,
-                                lsn: *lsn,
-                                col_values: Vec::new(),
-                                key_values: old_values,
-                                col_unchanged: Vec::new(),
-                            },
-                        );
-                    }
-                }
-            }
-            'B' => {
-                let _final_lsn = read_i64(data, &mut cursor) as u64;
-                let _commit_time = read_i64(data, &mut cursor);
-                let _xid = read_i32(data, &mut cursor);
-            }
-            'C' => {
-                let _flags = read_byte(data, &mut cursor);
-                let _commit_lsn = read_i64(data, &mut cursor) as u64;
-                let end_lsn = read_i64(data, &mut cursor) as u64;
-                let _commit_time = read_i64(data, &mut cursor);
-                group.pending_lsn = end_lsn;
-            }
-            'T' => {
-                // TRUNCATE — flush per-table pending queues, then DELETE all from targets.
-                // Uses DELETE FROM instead of TRUNCATE because DuckLake tables
-                // (via pg_duckdb) silently ignore TRUNCATE — it succeeds but
-                // doesn't actually remove rows.
-                let nrels = read_i32(data, &mut cursor);
-                let _options = read_byte(data, &mut cursor);
-
-                for _ in 0..nrels {
-                    let rel_id = read_i32(data, &mut cursor) as u32;
-                    if let Some(cached) = rel_cache.get(&rel_id) {
-                        let mapping =
-                            resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
-                        if let Some(mapping) = mapping {
-                            if mapping.enabled && mapping.state != "ERRORED" {
-                                let target_key =
-                                    format!("{}.{}", mapping.target_schema, mapping.target_table);
-                                // Drain this table's queue before DELETE
-                                coordinator.drain_and_wait_table(&target_key);
-
-                                let delete_sql = format!(
-                                    "DELETE FROM \"{}\".\"{}\"",
-                                    mapping.target_schema.replace('"', "\"\""),
-                                    mapping.target_table.replace('"', "\"\"")
+                if let Some(cached) = rel_cache.get(&rel_id) {
+                    let mapping = resolve_mapping(meta, group.id, rel_id, &cached.entry).await?;
+                    if let Some(mapping) = mapping {
+                        if mapping.enabled && mapping.state != "ERRORED" {
+                            let target_key =
+                                format!("{}.{}", mapping.target_schema, mapping.target_table);
+                            coordinator.drain_and_wait_table(&target_key);
+                            let delete_sql = format!(
+                                "DELETE FROM \"{}\".\"{}\"",
+                                mapping.target_schema.replace('"', "\"\""),
+                                mapping.target_table.replace('"', "\"\"")
+                            );
+                            if let Err(e) = client.execute(&delete_sql, &[]).await {
+                                tracing::error!(
+                                    "pg_duckpipe: failed to clear target table {}.{}: {}",
+                                    mapping.target_schema, mapping.target_table, e
                                 );
-                                if let Err(e) = client.execute(&delete_sql, &[]).await {
-                                    tracing::error!(
-                                        "pg_duckpipe: failed to clear target table {}.{}: {}",
-                                        mapping.target_schema, mapping.target_table, e
-                                    );
-                                }
                             }
                         }
                     }
                 }
             }
-            _ => {}
         }
-
-        total_processed += 1;
+        _ => {}
     }
 
-    // Drain flush results and update in-memory per-table LSN state.
-    // Must happen before confirmed_lsn computation — the ordering guarantee:
-    // flush threads commit applied_lsn to PG *before* sending the mpsc result,
-    // so any Success result here means PG is already up-to-date for that table.
+    Ok(false)
+}
+
+/// Run post-batch bookkeeping: collect flush results, auto-retry errored tables,
+/// transition CATCHUP → STREAMING, and persist confirmed_lsn + StandbyStatusUpdate.
+///
+/// Called periodically from the inline streaming loop (every `HEARTBEAT_COMMITS`
+/// commits or `HEARTBEAT_INTERVAL` ms) and once after the loop ends.
+/// Returns the current confirmed_lsn (0 if not yet established).
+async fn run_heartbeat(
+    meta: &MetadataClient<'_>,
+    group: &mut SyncGroup,
+    coordinator: &mut FlushCoordinator,
+    consumer: &mut SlotConsumer,
+    rel_cache: &mut HashMap<u32, RelCacheWithMapping>,
+) -> Result<u64, String> {
+    // 1. Drain flush results; invalidate rel_cache entries for errored tables so
+    //    the next WAL event re-fetches state (table may have transitioned to ERRORED).
     for r in &coordinator.collect_results() {
         if let FlushThreadResult::Error { target_key, error, mapping_id, .. } = r {
             tracing::error!("pg_duckpipe: flush error for {}: {}", target_key, error);
-            // Invalidate the cached mapping so the next WAL event for this table
-            // re-fetches state from PG — it may have transitioned to ERRORED.
             for cached in rel_cache.values_mut() {
                 if cached.mapping.as_ref().map_or(false, |m| &m.id == mapping_id) {
                     cached.mapping = None;
@@ -489,7 +363,7 @@ async fn process_wal_messages(
         }
     }
 
-    // Auto-retry ERRORED tables whose retry_at has passed
+    // 2. Auto-retry ERRORED tables whose retry_at has passed.
     if let Ok(retryable) = meta.get_retryable_errored_tables(group.id).await {
         for table in &retryable {
             if let Err(e) = meta.retry_errored_table(table.id).await {
@@ -516,14 +390,12 @@ async fn process_wal_messages(
         }
     }
 
-    // Transition CATCHUP → STREAMING
+    // 3. Transition CATCHUP → STREAMING for tables that have caught up.
     if group.pending_lsn != 0 {
         meta.transition_catchup_to_streaming(group.id, group.pending_lsn)
             .await
             .map_err(|e| format!("transition_catchup: {}", e))?;
-
-        // Mirror the transition in the rel_cache so routing reflects the new state
-        // immediately without waiting for the next periodic refresh.
+        // Mirror the transition immediately in rel_cache.
         for cached in rel_cache.values_mut() {
             if let Some(ref mut mapping) = cached.mapping {
                 if mapping.state == "CATCHUP"
@@ -536,38 +408,133 @@ async fn process_wal_messages(
         }
     }
 
-    // Update confirmed_lsn using the in-memory per-table LSN state for crash-safe slot
-    // advancement.  All active STREAMING/CATCHUP tables are seeded into per_table_lsn
-    // at cycle start (via seed_table_lsns), so the min covers all tables regardless of
-    // whether they received changes this cycle.
-    //
-    // Fall back to the PG query when the coordinator has no tables yet (e.g., first
-    // cycle after startup before any changes arrive, or all tables just errored out).
-    let mut safe_confirmed_lsn: u64 = 0;
-    if total_processed > 0 && group.pending_lsn != 0 {
+    // 4. Compute confirmed_lsn from in-memory per-table state and persist + report it.
+    //    No PG fallback needed here — run_sync_cycle seeds table lsns at cycle start.
+    let min_lsn = coordinator.get_min_applied_lsn_in_coordinator();
+    if min_lsn > 0 {
+        meta.update_confirmed_lsn(group.id, min_lsn)
+            .await
+            .map_err(|e| format!("update_confirmed_lsn: {}", e))?;
+        consumer.send_status_update(min_lsn);
+    }
+
+    Ok(min_lsn)
+}
+
+/// Process one sync group using streaming replication for WAL consumption.
+///
+/// Inline hot path: `recv → decode → push_change` with no intermediate buffer.
+/// Bookkeeping (flush results, auto-retry, CATCHUP→STREAMING, confirmed_lsn)
+/// runs via `run_heartbeat` every `HEARTBEAT_COMMITS` commits or
+/// `HEARTBEAT_INTERVAL` ms, whichever comes first.
+async fn process_sync_group_streaming(
+    client: &Client,
+    meta: &MetadataClient<'_>,
+    group: &mut SyncGroup,
+    config: &ServiceConfig,
+    consumer: &mut SlotConsumer,
+    coordinator: &mut FlushCoordinator,
+    rel_cache: &mut HashMap<u32, RelCacheWithMapping>,
+) -> Result<ProcessResult, String> {
+    let timing = config.debug_log;
+    let group_start = if timing { Some(Instant::now()) } else { None };
+
+    // Check backpressure — if flush threads are lagging behind, skip this poll round.
+    // Still compute confirmed_lsn and advance slot so lag_bytes stays current.
+    if coordinator.is_backpressured() {
         let min_lsn = {
             let in_mem = coordinator.get_min_applied_lsn_in_coordinator();
             if in_mem > 0 {
                 in_mem
             } else {
-                // No in-memory state yet — read from PG (startup / post-clear path).
-                meta.get_min_applied_lsn(group.id)
-                    .await
-                    .map_err(|e| format!("get_min_applied_lsn: {}", e))?
+                meta.get_min_applied_lsn(group.id).await.unwrap_or(0)
             }
         };
         if min_lsn > 0 {
-            meta.update_confirmed_lsn(group.id, min_lsn)
-                .await
-                .map_err(|e| format!("update_confirmed_lsn: {}", e))?;
-            safe_confirmed_lsn = min_lsn;
+            let _ = meta.update_confirmed_lsn(group.id, min_lsn).await;
+            consumer.send_status_update(min_lsn);
         }
+        return Ok(ProcessResult { total_processed: 0, any_work: false, confirmed_lsn: min_lsn });
+    }
+
+    // first_msg_timeout: how long to wait for the very first WAL message this cycle.
+    // loop_deadline: absolute deadline for the entire batch (set once, checked each iteration).
+    // recv_fast: greedily drain subsequent messages with a minimal per-call timeout.
+    let first_msg_timeout = Duration::from_millis((config.poll_interval_ms / 2).max(100) as u64);
+    let loop_deadline = Instant::now() + first_msg_timeout;
+    let recv_fast = Duration::from_millis(1);
+
+    let mut have_first = false;
+    let mut total_processed: i32 = 0;
+    let mut commits_since_heartbeat: u32 = 0;
+    let mut last_heartbeat = Instant::now();
+
+    loop {
+        // Hard cap: stop accumulating once we reach batch_size_per_group.
+        if total_processed >= config.batch_size_per_group {
+            break;
+        }
+        // After receiving the first message, honour the overall batch deadline.
+        if have_first && Instant::now() >= loop_deadline {
+            break;
+        }
+        // Yield to flush threads when queues are saturated.
+        if coordinator.is_backpressured() {
+            break;
+        }
+
+        let timeout = if !have_first { first_msg_timeout } else { recv_fast };
+        match consumer.recv_one(timeout).await? {
+            None => break,
+            Some((lsn, data)) => {
+                have_first = true;
+                let is_commit =
+                    process_one_wal_message(client, meta, group, lsn, &data, coordinator, rel_cache)
+                        .await?;
+                total_processed += 1;
+                if is_commit {
+                    commits_since_heartbeat += 1;
+                }
+                // Periodic heartbeat: bookkeeping every N commits or T ms.
+                if commits_since_heartbeat >= HEARTBEAT_COMMITS
+                    || last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL
+                {
+                    run_heartbeat(meta, group, coordinator, consumer, rel_cache).await?;
+                    commits_since_heartbeat = 0;
+                    last_heartbeat = Instant::now();
+                }
+            }
+        }
+    }
+
+    // Final heartbeat: always runs regardless of message count.
+    // Handles the no-WAL path and ensures confirmed_lsn is always up-to-date.
+    let confirmed_lsn = run_heartbeat(meta, group, coordinator, consumer, rel_cache).await?;
+
+    // If no messages were processed, send StandbyStatusUpdate so the slot's
+    // confirmed_flush_lsn reflects any flush progress since the last cycle
+    // (e.g. flush threads completing catch-up while WAL is quiet).
+    if total_processed == 0 {
+        let min = coordinator.get_min_applied_lsn_in_coordinator();
+        if min > 0 {
+            consumer.send_status_update(min);
+        }
+    }
+
+    if let Some(start) = group_start {
+        tracing::debug!(
+            "DuckPipe timing: action=process_sync_group_streaming group={} slot={} processed_changes={} elapsed_ms={:.3}",
+            group.name,
+            group.slot_name,
+            total_processed,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     Ok(ProcessResult {
         total_processed,
         any_work: total_processed > 0,
-        confirmed_lsn: safe_confirmed_lsn,
+        confirmed_lsn,
     })
 }
 

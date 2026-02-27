@@ -78,12 +78,77 @@ impl SlotConsumer {
         self.client.is_running()
     }
 
+    /// Convert one replication event to a `(lsn, pgoutput_bytes)` tuple.
+    ///
+    /// Returns `None` for KeepAlive, Message, and StoppedAt events which carry
+    /// no pgoutput payload. The crate pre-parses BEGIN/COMMIT into separate event
+    /// variants, so we synthesize the corresponding pgoutput binary messages to
+    /// keep the decoder feeding on identical data regardless of which receive
+    /// path is used.
+    fn event_to_message(event: ReplicationEvent) -> Option<(u64, Vec<u8>)> {
+        match event {
+            ReplicationEvent::XLogData { wal_start, data, .. } => {
+                Some((wal_start.0, data.to_vec()))
+            }
+            ReplicationEvent::Begin { final_lsn, xid, commit_time_micros } => {
+                // Synthesize pgoutput 'B' (Begin) binary message:
+                //   [type='B':u8] [final_lsn:i64] [commit_time:i64] [xid:i32]
+                let mut buf = Vec::with_capacity(21);
+                buf.push(b'B');
+                buf.extend_from_slice(&(final_lsn.0 as i64).to_be_bytes());
+                buf.extend_from_slice(&commit_time_micros.to_be_bytes());
+                buf.extend_from_slice(&(xid as i32).to_be_bytes());
+                Some((final_lsn.0, buf))
+            }
+            ReplicationEvent::Commit { lsn, end_lsn, commit_time_micros } => {
+                // Synthesize pgoutput 'C' (Commit) binary message:
+                //   [type='C':u8] [flags=0:u8] [commit_lsn:i64] [end_lsn:i64] [commit_time:i64]
+                let mut buf = Vec::with_capacity(26);
+                buf.push(b'C');
+                buf.push(0u8); // flags
+                buf.extend_from_slice(&(lsn.0 as i64).to_be_bytes());
+                buf.extend_from_slice(&(end_lsn.0 as i64).to_be_bytes());
+                buf.extend_from_slice(&commit_time_micros.to_be_bytes());
+                Some((end_lsn.0, buf))
+            }
+            // KeepAlive: handled internally by the crate (standby status updates)
+            // Message: logical decoding messages — skip
+            // StoppedAt: clean stream end
+            _ => None,
+        }
+    }
+
+    /// Receive exactly one WAL message within `timeout`.
+    ///
+    /// Loops internally, skipping KeepAlive and Message events, until either a
+    /// data-bearing event (XLogData/Begin/Commit) arrives or the deadline elapses.
+    /// Returns `Ok(None)` on timeout, StoppedAt, or clean stream end.
+    /// Returns `Err` on a connection error.
+    pub async fn recv_one(&mut self, timeout: Duration) -> Result<Option<(u64, Vec<u8>)>, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            match tokio::time::timeout_at(deadline, self.client.recv()).await {
+                Err(_elapsed) => return Ok(None),
+                Ok(Err(e)) => return Err(format!("streaming recv: {}", e)),
+                Ok(Ok(None)) => return Ok(None),
+                Ok(Ok(Some(event))) => match event {
+                    ReplicationEvent::StoppedAt { .. } => return Ok(None),
+                    ReplicationEvent::KeepAlive { .. } | ReplicationEvent::Message { .. } => {
+                        // Skip; loop to try again within the remaining timeout window
+                    }
+                    other => {
+                        return Ok(Self::event_to_message(other));
+                    }
+                },
+            }
+        }
+    }
+
     /// Poll for WAL messages up to `max_count` or until `timeout_ms` elapses.
     ///
-    /// Returns a vec of `(lsn, pgoutput_binary_data)` tuples compatible with
-    /// `process_wal_messages()`. The crate pre-parses BEGIN/COMMIT into separate
-    /// event variants, so we synthesize the corresponding pgoutput binary messages
-    /// to keep both consumption paths feeding identical data into the shared decoder.
+    /// Delegates to `recv_one` for each message. Returns a vec of
+    /// `(lsn, pgoutput_binary_data)` tuples.
     pub async fn poll_messages(
         &mut self,
         max_count: i32,
@@ -91,76 +156,28 @@ impl SlotConsumer {
     ) -> Result<Vec<(u64, Vec<u8>)>, String> {
         let mut messages = Vec::new();
         let max = max_count as usize;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let overall_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
         loop {
             if messages.len() >= max {
                 break;
             }
+            let now = tokio::time::Instant::now();
+            if now >= overall_deadline {
+                break;
+            }
+            let remaining = overall_deadline - now;
 
-            let recv_result = tokio::time::timeout_at(deadline, self.client.recv()).await;
-
-            match recv_result {
-                Err(_elapsed) => {
-                    // Timeout — return what we have
-                    break;
-                }
-                Ok(Err(e)) => {
+            match self.recv_one(remaining).await {
+                Err(e) => {
                     // Connection error — return what we have if non-empty, else propagate
                     if messages.is_empty() {
-                        return Err(format!("streaming recv: {}", e));
+                        return Err(e);
                     }
                     break;
                 }
-                Ok(Ok(None)) => {
-                    // Stream ended cleanly
-                    break;
-                }
-                Ok(Ok(Some(event))) => match event {
-                    ReplicationEvent::XLogData {
-                        wal_start, data, ..
-                    } => {
-                        messages.push((wal_start.0, data.to_vec()));
-                    }
-                    ReplicationEvent::Begin {
-                        final_lsn,
-                        xid,
-                        commit_time_micros,
-                    } => {
-                        // Synthesize pgoutput 'B' (Begin) binary message:
-                        //   [type='B':u8] [final_lsn:i64] [commit_time:i64] [xid:i32]
-                        let mut buf = Vec::with_capacity(21);
-                        buf.push(b'B');
-                        buf.extend_from_slice(&(final_lsn.0 as i64).to_be_bytes());
-                        buf.extend_from_slice(&commit_time_micros.to_be_bytes());
-                        buf.extend_from_slice(&(xid as i32).to_be_bytes());
-                        messages.push((final_lsn.0, buf));
-                    }
-                    ReplicationEvent::Commit {
-                        lsn,
-                        end_lsn,
-                        commit_time_micros,
-                    } => {
-                        // Synthesize pgoutput 'C' (Commit) binary message:
-                        //   [type='C':u8] [flags=0:u8] [commit_lsn:i64] [end_lsn:i64] [commit_time:i64]
-                        let mut buf = Vec::with_capacity(26);
-                        buf.push(b'C');
-                        buf.push(0u8); // flags
-                        buf.extend_from_slice(&(lsn.0 as i64).to_be_bytes());
-                        buf.extend_from_slice(&(end_lsn.0 as i64).to_be_bytes());
-                        buf.extend_from_slice(&commit_time_micros.to_be_bytes());
-                        messages.push((end_lsn.0, buf));
-                    }
-                    ReplicationEvent::KeepAlive { .. } => {
-                        // Handled internally by crate (standby status updates)
-                    }
-                    ReplicationEvent::Message { .. } => {
-                        // Logical decoding messages — skip
-                    }
-                    ReplicationEvent::StoppedAt { .. } => {
-                        break;
-                    }
-                },
+                Ok(None) => break,
+                Ok(Some(msg)) => messages.push(msg),
             }
         }
 
