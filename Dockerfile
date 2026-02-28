@@ -59,7 +59,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ###############################################################################
 ### OUTPUT — pg_ducklake + pg_duckpipe, ready to use
 ###############################################################################
-FROM pgducklake/pgducklake:${PG_VERSION}-main
+FROM pgducklake/pgducklake:${PG_VERSION}-main AS output
 ARG PG_VERSION
 
 USER root
@@ -98,14 +98,9 @@ RUN echo "/usr/lib/postgresql/${PG_VERSION}/lib" > /etc/ld.so.conf.d/duckdb.conf
 # survives the Docker volume mount at /var/lib/postgresql/data.
 #
 # DuckDB version must match libduckdb.so shipped by pg_ducklake in this image.
+COPY docker/fetch-ducklake-ext.sh /usr/local/bin/fetch-ducklake-ext.sh
 RUN apt-get update -qq && apt-get install -y --no-install-recommends curl && \
-    DUCKDB_VER="v1.4.3" && \
-    ARCH="$(uname -m | sed 's/x86_64/linux_amd64/;s/aarch64/linux_arm64/')" && \
-    EXT_DIR="/var/lib/postgresql/.duckdb/extensions/${DUCKDB_VER}/${ARCH}" && \
-    mkdir -p "${EXT_DIR}" && \
-    curl -fsSL \
-        "https://extensions.duckdb.org/${DUCKDB_VER}/${ARCH}/ducklake.duckdb_extension.gz" \
-        | gzip -d > "${EXT_DIR}/ducklake.duckdb_extension" && \
+    /usr/local/bin/fetch-ducklake-ext.sh && \
     chown -R postgres:postgres /var/lib/postgresql/.duckdb && \
     apt-get remove -y curl && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
