@@ -25,24 +25,33 @@ PostgreSQL extension for real-time CDC to pg_ducklake
 
 ```bash
 # Start PostgreSQL with pg_duckpipe (includes pg_duckdb + pg_ducklake)
-docker run -d --name duckpipe -p 5432:5432 -e POSTGRES_PASSWORD=duckdb pgducklake/pgduckpipe:18-main
+docker run -d --name duckpipe -p 15432:5432 -e POSTGRES_PASSWORD=duckdb pgducklake/pgduckpipe:18-main
 
 # Connect
-psql -h localhost -U postgres
+PGPASSWORD=duckdb psql -h localhost -p 15432 -U postgres
 ```
+
+Create a table, add it to sync, insert some rows, and query the columnar copy:
 
 ```sql
-CREATE TABLE orders (id BIGSERIAL PRIMARY KEY, customer_id BIGINT, amount NUMERIC);
+-- Create a source table (must have a primary key)
+CREATE TABLE orders (id BIGSERIAL PRIMARY KEY, customer_id BIGINT, total INT);
 
-SELECT duckpipe.add_table('public.orders');            -- start CDC to DuckLake
+-- Insert some existing data
+INSERT INTO orders(customer_id, total) VALUES (101, 4250), (102, 9900);
 
-INSERT INTO orders(customer_id, amount) VALUES (101, 42.50), (102, 99.00);
+-- Start syncing to DuckLake (snapshots existing rows, then streams new changes)
+SELECT duckpipe.add_table('public.orders');
 
-SELECT * FROM orders_ducklake;                         -- query the columnar copy
+-- New writes are captured in real time
+INSERT INTO orders(customer_id, total) VALUES (103, 1575);
+
+-- Query the columnar copy (wait a few seconds for CDC to flush)
+SELECT * FROM orders_ducklake;
+
+-- Monitor sync state
 SELECT source_table, state, rows_synced FROM duckpipe.status();
 ```
-
-> Building from source? `CREATE EXTENSION pg_duckpipe CASCADE;` first, then the same SQL above.
 
 ## Requirements
 
@@ -54,18 +63,12 @@ SELECT source_table, state, rows_synced FROM duckpipe.status();
 - Both extensions must be preloaded: `shared_preload_libraries = 'pg_duckdb, pg_duckpipe'`
 - Source tables must have a **PRIMARY KEY** (required by logical replication to identify rows)
 
-## Build (From Source)
+## Build & Test
 
 ```bash
-make
-make install
-```
-
-## Test
-
-```bash
-make installcheck               # Build + install + run all regression tests
-make check-regression TEST=api  # Run a single test
+make && make install             # Build and install the extension
+make installcheck                # Run all regression tests
+make check-regression TEST=api   # Run a single test
 ```
 
 ## Documentation
