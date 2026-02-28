@@ -144,4 +144,4 @@ Current regression schedule contains 20 tests under `test/regression/`.
 
 ## License
 
-PostgreSQL License.
+[MIT](LICENSE)
