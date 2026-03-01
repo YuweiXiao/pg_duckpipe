@@ -21,7 +21,7 @@
 - [x] Fully decoupled WAL/flush — self-triggered flush (batch threshold OR time interval), backpressure via AtomicI64, flush threads own tokio runtime + PG metadata updates
 - [x] PostgreSQL extension (pgrx): SQL API, GUCs, bgworker, bootstrap DDL
 - [x] Standalone daemon (duckpipe-daemon) over TCP
-- [x] 19 regression tests all passing
+- [x] 22 regression tests all passing
 - [x] Observability: `status()` SRF exposes `consecutive_failures`, `retry_at`, `applied_lsn`, `queued_changes` per table
 - [x] Observability: `worker_status()` SRF exposes `total_queued_changes`, `is_backpressured`
 - [x] Standardized logging: shared `init_subscriber`, all `eprintln!` replaced with `tracing` macros
@@ -30,6 +30,7 @@
 - [x] Large catch-up batch stall (pure-insert path) — fixed via `may_have_conflicts` flag skipping DELETE scan
 - [x] `lag_bytes` flat during catch-up — fixed: `StandbyStatusUpdate` sent each cycle even when no new WAL
 - [x] Flush-thread drain capped at `batch_threshold` for incremental progress visibility
+- [x] Mixed DML correctness — flush DELETE WHERE clause was using all columns (REPLICA IDENTITY FULL `attkeys`) instead of real PK from `pg_index`; fixed by caching `pk_key_attrs` per relation and using it for `extract_key_values` and flush queue setup
 
 ## TODO
 
@@ -38,6 +39,10 @@
 - [ ] Batch compaction tuning — reduce Parquet file proliferation under sustained small-batch writes
 - [ ] Inline data flush
 - [ ] Parquet-over-PG write throughput — ~10k rows/sec cap; bottleneck for large catch-up batches
+- [ ] DELETE phase dominates mixed DML flush — 15.5ms avg (50% of flush time) for single-table `oltp_read_write`; cross-catalog `EXISTS` join scans full Parquet each time. Consider DuckLake-native delete-by-PK API or batched positional deletes to avoid full-table scan.
+- [ ] DuckLake commit contention in multi-table flushes — commit phase jumps from 1.7ms (1 table) to 10.9ms (4 tables); likely DuckLake metadata lock contention across parallel flush workers. Investigate DuckLake-level concurrency improvements or flush batching across tables.
+- [ ] Mixed DML catch-up throughput appears as 0 rows/s — `rows_synced` counter only reflects net row count change, so UPDATE/DELETE-heavy workloads show no progress even while actively flushing. Need a separate `changes_applied` counter to track actual WAL processing throughput.
+- [ ] Mixed DML replication lag 50-100x higher than append — 170-377 MB avg vs 3-64 MB; each UPDATE generates DELETE+INSERT in WAL (REPLICA IDENTITY FULL sends full old+new tuples) and flush must scan Parquet for DELETE. Investigate streaming-mode flush during OLTP (currently flush only happens during catch-up idle periods).
 - [x] WAL consumer: inline `recv → decode → push_change` hot path — eliminated collect-all-then-process Vec buffer. Bookkeeping (flush results, auto-retry, CATCHUP→STREAMING, confirmed_lsn) now runs every 10k commits or 500ms via `run_heartbeat`, eliminating the trailing 1-row straddle flush and producing steady ~10k-row Parquet files.
 
 ### Features
@@ -55,7 +60,7 @@
 - [x] Benchmark suite (`bench_suite.sh`) — 4 scenarios (single/multi × insert/mixed) with automated analysis report (`analyze_results.py`)
 
 ### Bugs
-- [ ] Mixed DML (oltp_read_write) catch-up stall — target count > source count after catch-up; DELETEs under-applied during flush; WAL consumer reports 0 changes despite pending lag
+- [x] Mixed DML (oltp_read_write) consistency failure — fixed: flush DELETE used all-column WHERE clause instead of PK-only (see Done section)
 
 ### Robustness
 - [ ] Snapshot failures have no retry backoff — risk of thrash on repeated failures
