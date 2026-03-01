@@ -12,10 +12,50 @@ brew install sysbench   # or: apt install sysbench
 ./benchmark/bench.sh
 
 # Customize
-./benchmark/bench.sh --threads 4 --duration 60 --table-size 100000
+./benchmark/bench.sh --threads 4 --duration 60 --table-size 100000 --workload oltp_read_write
 ```
 
 `bench.sh` starts a temporary PostgreSQL instance (port 5556), runs the benchmark, and prints results. No cleanup needed.
+
+## Benchmark Suite
+
+Run all 4 benchmark scenarios with a single command and get an automated analysis report:
+
+```bash
+# Full suite (30s per scenario, ~5 min total)
+./benchmark/bench_suite.sh
+
+# Quick smoke test (10s per scenario)
+./benchmark/bench_suite.sh --duration 10
+
+# View the generated report
+cat benchmark/results/report.md
+```
+
+### Scenarios
+
+| # | Name | Tables | Workload | Evaluates |
+|---|------|--------|----------|-----------|
+| 1 | Single-table append | 1 x 100k | `oltp_insert` | Baseline throughput |
+| 2 | Multi-table append | 4 x 100k | `oltp_insert` | Parallel flush scaling |
+| 3 | Single-table mixed DML | 1 x 100k | `oltp_read_write` | UPDATE/DELETE correctness |
+| 4 | Multi-table mixed DML | 4 x 100k | `oltp_read_write` | Combined stress |
+
+### Analysis Report
+
+The suite automatically generates `benchmark/results/report.md` containing:
+
+1. **Summary Table** — all scenarios side-by-side (snapshot rate, TPS, lag, catch-up, consistency)
+2. **Flush Performance** — per-scenario flush stats (count, avg/p50/p99 latency, rows/flush, phase breakdown)
+3. **Snapshot Timings** — per-table snapshot durations from PG logs
+4. **WAL Processing** — WAL cycle time statistics
+5. **Issues & Observations** — errors, warnings, backpressure events, anomalies
+
+You can also run the analysis standalone on existing logs:
+
+```bash
+python3 benchmark/analyze_results.py --results-dir benchmark/results
+```
 
 ## Workloads
 

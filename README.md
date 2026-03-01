@@ -66,6 +66,48 @@ SELECT source_table, state, rows_synced FROM duckpipe.status();
 - Both extensions must be preloaded: `shared_preload_libraries = 'pg_duckdb, pg_duckpipe'`
 - Source tables must have a **PRIMARY KEY** (required by logical replication to identify rows)
 
+## Benchmark
+
+Sysbench results on Apple M1 Pro / 100k rows per table / 30s OLTP phase.
+Mixed DML uses `oltp_read_write` (2 UPDATEs + 1 DELETE + 1 INSERT per txn on 100k-row base tables):
+
+| Scenario | Tables | Workload | Snapshot | OLTP TPS | Avg Lag | Catch-up | Consistency |
+|----------|--------|----------|----------|----------|---------|----------|-------------|
+| Single-table append | 1 | `oltp_insert` | 41,668 rows/s | 9,495 | 3.3 MB | 2.2 s | PASS |
+| Multi-table append | 4 | `oltp_insert` | 7,155 rows/s | 9,328 | 64.0 MB | 2.4 s | PASS |
+| Single-table mixed DML | 1 | `oltp_read_write` | 8,160 rows/s | 667 | 170.5 MB | 65.0 s | PASS |
+| Multi-table mixed DML | 4 | `oltp_read_write` | 7,544 rows/s | 477 | 377.3 MB | 68.4 s | PASS |
+
+<details>
+<summary>Flush performance breakdown</summary>
+
+| Metric | 1 table insert | 4 tables insert | 1 table mixed | 4 tables mixed |
+|--------|----------------|-----------------|----------------|----------------|
+| Flush count | 30 | 121 | 30 | 122 |
+| Avg latency (ms) | 34.4 | 19.8 | 31.2 | 26.9 |
+| P99 latency (ms) | 71.6 | 144.1 | 43.8 | 127.8 |
+| Avg rows/flush | 9,496 | 2,313 | 4,002 | 704 |
+
+Phase breakdown (avg ms):
+
+| Phase | 1 table insert | 4 tables insert | 1 table mixed | 4 tables mixed |
+|-------|----------------|-----------------|----------------|----------------|
+| load | 16.6 | 4.6 | 7.2 | 1.8 |
+| compact | 5.1 | 3.5 | 3.8 | 3.3 |
+| delete | 0.3 | 0.3 | 15.5 | 8.4 |
+| insert | 8.5 | 4.4 | 2.0 | 1.6 |
+| commit | 2.2 | 5.5 | 1.7 | 10.9 |
+
+</details>
+
+Run benchmarks yourself:
+
+```bash
+./benchmark/bench_suite.sh              # All 4 scenarios (30s each)
+./benchmark/bench_suite.sh --duration 10  # Quick smoke test
+cat benchmark/results/report.md         # View the generated report
+```
+
 ## Build & Test
 
 ```bash

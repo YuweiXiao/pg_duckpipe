@@ -1,4 +1,5 @@
 bench_data/
 bench_pg.log
+results/
 
 *.pyc
