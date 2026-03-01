@@ -47,11 +47,15 @@
 - [x] **`REPLICA IDENTITY FULL` enforced** — `add_table()` always issues `ALTER TABLE <src> REPLICA IDENTITY FULL`. The flush path has no TOAST-unchanged fallback: buffer table has no `{col}_unchanged` columns, appender rows are narrower (ncols not 2×ncols), and TOAST resolution is gone. Any `col_unchanged = true` in WAL (source identity changed after add) surfaces as a hard flush error triggering the existing backoff retry path. Trade-off: higher WAL volume on source.
 - [x] Dockerfile for setting up a self-contained playground env
 - [ ] CI: `cargo chef` pattern to cache Rust dependency compilation across GHA runs
+- [ ] Sync tables that have no PK and ensure e2e EOS
 
 ### Monitoring / Observability
 - [ ] `applied_lsn` stays NULL during SNAPSHOT/CATCHUP — should be set to `snapshot_lsn` after snapshot completes
 - [ ] `worker_state` not updated during snapshot processing — stale metrics while snapshots run
-- [ ] A script for parsing perf log from benchmark and generate readable output
+- [x] Benchmark suite (`bench_suite.sh`) — 4 scenarios (single/multi × insert/mixed) with automated analysis report (`analyze_results.py`)
+
+### Bugs
+- [ ] Mixed DML (oltp_read_write) catch-up stall — target count > source count after catch-up; DELETEs under-applied during flush; WAL consumer reports 0 changes despite pending lag
 
 ### Robustness
 - [ ] Snapshot failures have no retry backoff — risk of thrash on repeated failures

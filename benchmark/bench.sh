@@ -5,12 +5,15 @@
 #   ./benchmark/bench.sh [options]
 #
 # Options (all optional, defaults shown):
-#   --threads N        sysbench writer threads  (default: 1)
-#   --duration N       OLTP phase seconds       (default: 30)
-#   --table-size N     initial rows per table   (default: 100000)
-#   --tables N         number of tables         (default: 1)
-#   --catchup-timeout N  catch-up wait limit     (default: 600)
-#   --skip-db-start    reuse the existing DB instead of a fresh one
+#   --threads N           sysbench writer threads  (default: 1)
+#   --duration N          OLTP phase seconds       (default: 30)
+#   --table-size N        initial rows per table   (default: 100000)
+#   --tables N            number of tables         (default: 1)
+#   --workload NAME       sysbench workload        (default: oltp_insert)
+#   --consistency-mode M  consistency check mode   (default: auto)
+#   --catchup-timeout N   catch-up wait limit      (default: 600)
+#   --log-file PATH       capture output to file   (default: none)
+#   --skip-db-start       reuse the existing DB instead of a fresh one
 #   --help
 
 set -euo pipefail
@@ -23,19 +26,25 @@ THREADS=1
 DURATION=30
 TABLE_SIZE=100000
 TABLES=1
+WORKLOAD=oltp_insert
+CONSISTENCY_MODE=auto
 CATCHUP_TIMEOUT=600
 SKIP_DB_START=0
+LOG_FILE=""
 PORT=5556
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --threads)        THREADS="$2";        shift 2 ;;
-        --duration)       DURATION="$2";       shift 2 ;;
-        --table-size)     TABLE_SIZE="$2";     shift 2 ;;
-        --tables)         TABLES="$2";         shift 2 ;;
-        --catchup-timeout) CATCHUP_TIMEOUT="$2"; shift 2 ;;
-        --skip-db-start)  SKIP_DB_START=1;     shift ;;
+        --threads)           THREADS="$2";           shift 2 ;;
+        --duration)          DURATION="$2";          shift 2 ;;
+        --table-size)        TABLE_SIZE="$2";        shift 2 ;;
+        --tables)            TABLES="$2";            shift 2 ;;
+        --workload)          WORKLOAD="$2";          shift 2 ;;
+        --consistency-mode)  CONSISTENCY_MODE="$2";  shift 2 ;;
+        --catchup-timeout)   CATCHUP_TIMEOUT="$2";   shift 2 ;;
+        --log-file)          LOG_FILE="$2";          shift 2 ;;
+        --skip-db-start)     SKIP_DB_START=1;        shift ;;
         --help|-h)
             sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \?//'
             exit 0 ;;
@@ -48,8 +57,8 @@ DB_URL="host=localhost port=$PORT user=postgres dbname=postgres"
 echo "==========================================================="
 echo " pg_duckpipe End-to-End Benchmark"
 echo "==========================================================="
-echo " threads=$THREADS  duration=${DURATION}s  table_size=$TABLE_SIZE  tables=$TABLES"
-echo " catchup_timeout=${CATCHUP_TIMEOUT}s"
+echo " workload=$WORKLOAD  threads=$THREADS  duration=${DURATION}s  table_size=$TABLE_SIZE  tables=$TABLES"
+echo " consistency_mode=$CONSISTENCY_MODE  catchup_timeout=${CATCHUP_TIMEOUT}s"
 echo "==========================================================="
 echo ""
 
@@ -67,11 +76,21 @@ fi
 echo "[2/2] Running benchmark..."
 echo ""
 
-python3 "$BENCH_DIR/run_sysbench.py" \
-    --db-url "$DB_URL" \
-    --workload oltp_insert \
-    --tables "$TABLES" \
-    --table-size "$TABLE_SIZE" \
-    --threads "$THREADS" \
-    --duration "$DURATION" \
+BENCH_CMD=(
+    python3 "$BENCH_DIR/run_sysbench.py"
+    --db-url "$DB_URL"
+    --workload "$WORKLOAD"
+    --consistency-mode "$CONSISTENCY_MODE"
+    --tables "$TABLES"
+    --table-size "$TABLE_SIZE"
+    --threads "$THREADS"
+    --duration "$DURATION"
     --catchup-timeout "$CATCHUP_TIMEOUT"
+)
+
+if [[ -n "$LOG_FILE" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    "${BENCH_CMD[@]}" 2>&1 | tee "$LOG_FILE"
+else
+    "${BENCH_CMD[@]}"
+fi
