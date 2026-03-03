@@ -27,6 +27,9 @@ pub fn parse_connstr(connstr: &str) -> ConnParams {
 }
 
 /// Parse a libpq-style `key=value` connection string.
+///
+/// Handles single-quoted values per the libpq spec: `password='my pass'`.
+/// Inside quotes, backslash escapes the next character (`\'` and `\\`).
 fn parse_keyvalue(connstr: &str) -> ConnParams {
     let mut host = "localhost".to_string();
     let mut port: u16 = 5432;
@@ -35,21 +38,19 @@ fn parse_keyvalue(connstr: &str) -> ConnParams {
     let mut dbname = "postgres".to_string();
     let mut sslmode = None;
 
-    for part in connstr.split_whitespace() {
-        if let Some((key, value)) = part.split_once('=') {
-            match key {
-                "host" | "hostaddr" => host = value.to_string(),
-                "port" => {
-                    if let Ok(p) = value.parse() {
-                        port = p;
-                    }
+    for (key, value) in parse_keyvalue_pairs(connstr) {
+        match key.as_str() {
+            "host" | "hostaddr" => host = value,
+            "port" => {
+                if let Ok(p) = value.parse() {
+                    port = p;
                 }
-                "user" => user = value.to_string(),
-                "password" => password = value.to_string(),
-                "dbname" => dbname = value.to_string(),
-                "sslmode" => sslmode = Some(value.to_string()),
-                _ => {}
             }
+            "user" => user = value,
+            "password" => password = value,
+            "dbname" => dbname = value,
+            "sslmode" => sslmode = Some(value),
+            _ => {}
         }
     }
 
@@ -61,6 +62,72 @@ fn parse_keyvalue(connstr: &str) -> ConnParams {
         dbname,
         sslmode,
     }
+}
+
+/// Parse libpq key=value pairs, handling single-quoted values with backslash escapes.
+fn parse_keyvalue_pairs(connstr: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut chars = connstr.chars().peekable();
+
+    loop {
+        // Skip whitespace between pairs
+        while chars.peek().map_or(false, |c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        // Read key (up to '=')
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' {
+                chars.next(); // consume '='
+                break;
+            }
+            if c.is_whitespace() {
+                break;
+            }
+            key.push(c);
+            chars.next();
+        }
+
+        if key.is_empty() {
+            break;
+        }
+
+        // Read value — may be single-quoted
+        let value = if chars.peek() == Some(&'\'') {
+            chars.next(); // consume opening quote
+            let mut val = String::new();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    // Backslash escape: next char is literal
+                    if let Some(escaped) = chars.next() {
+                        val.push(escaped);
+                    }
+                } else if c == '\'' {
+                    break; // closing quote
+                } else {
+                    val.push(c);
+                }
+            }
+            val
+        } else {
+            let mut val = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                val.push(c);
+                chars.next();
+            }
+            val
+        };
+
+        pairs.push((key, value));
+    }
+    pairs
 }
 
 /// Parse a PostgreSQL URI: `postgresql://user:password@host:port/dbname?params`
@@ -155,23 +222,28 @@ fn parse_uri(uri: &str) -> ConnParams {
 }
 
 /// Minimal percent-decoding for connection string values.
+///
+/// Accumulates decoded bytes and converts as UTF-8, so multi-byte sequences
+/// like `%C3%A9` (é) are handled correctly.
 fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.as_bytes().iter();
+    while let Some(&b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next().copied().unwrap_or(0);
+            let h2 = chars.next().copied().unwrap_or(0);
+            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16) {
+                bytes.push(byte);
             } else {
-                result.push('%');
-                result.push_str(&hex);
+                bytes.push(b'%');
+                bytes.push(h1);
+                bytes.push(h2);
             }
         } else {
-            result.push(c);
+            bytes.push(b);
         }
     }
-    result
+    String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
 }
 
 fn default_user() -> String {
@@ -180,19 +252,35 @@ fn default_user() -> String {
         .unwrap_or_else(|_| "postgres".to_string())
 }
 
+/// Quote a libpq connection string value if it contains whitespace or special chars.
+fn quote_connstr_value(val: &str) -> String {
+    if val.is_empty() || val.contains(|c: char| c.is_whitespace() || c == '\'' || c == '\\') {
+        let escaped = val.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("'{}'", escaped)
+    } else {
+        val.to_string()
+    }
+}
+
 /// Build a tokio-postgres connection string from ConnParams.
+///
+/// Values containing whitespace, quotes, or backslashes are properly
+/// single-quoted per the libpq connection string spec.
 pub fn build_tokio_pg_connstr(params: &ConnParams) -> String {
     let mut parts = vec![
-        format!("host={}", params.host),
+        format!("host={}", quote_connstr_value(&params.host)),
         format!("port={}", params.port),
-        format!("user={}", params.user),
-        format!("dbname={}", params.dbname),
+        format!("user={}", quote_connstr_value(&params.user)),
+        format!("dbname={}", quote_connstr_value(&params.dbname)),
     ];
     if !params.password.is_empty() {
-        parts.push(format!("password={}", params.password));
+        parts.push(format!(
+            "password={}",
+            quote_connstr_value(&params.password)
+        ));
     }
     if let Some(ref mode) = params.sslmode {
-        parts.push(format!("sslmode={}", mode));
+        parts.push(format!("sslmode={}", quote_connstr_value(mode)));
     }
     parts.join(" ")
 }
@@ -210,6 +298,10 @@ pub fn to_slot_connect_params(params: &ConnParams) -> SlotConnectParams {
 }
 
 /// Whether the given sslmode string requires TLS.
+///
+/// Note: `sslmode=prefer` is treated as `require` (TLS only, no plaintext
+/// fallback). This is stricter than libpq's behavior but avoids accidental
+/// plaintext connections. Use `sslmode=allow` or omit sslmode for plaintext.
 pub fn sslmode_needs_tls(sslmode: &Option<String>) -> bool {
     match sslmode.as_deref() {
         Some("require") | Some("verify-ca") | Some("verify-full") | Some("prefer") => true,
@@ -274,5 +366,190 @@ pub fn make_pgwire_tls_config(sslmode: &Option<String>) -> pgwire_replication::T
         Some("verify-full") => pgwire_replication::TlsConfig::verify_full(None),
         Some("prefer") => pgwire_replication::TlsConfig::require(),
         _ => pgwire_replication::TlsConfig::disabled(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_connstr: key=value format ---
+
+    #[test]
+    fn parse_simple_keyvalue() {
+        let p = parse_connstr("host=db.example.com port=5433 user=alice dbname=mydb");
+        assert_eq!(p.host, "db.example.com");
+        assert_eq!(p.port, 5433);
+        assert_eq!(p.user, "alice");
+        assert_eq!(p.dbname, "mydb");
+        assert!(p.password.is_empty());
+        assert!(p.sslmode.is_none());
+    }
+
+    #[test]
+    fn parse_keyvalue_with_sslmode() {
+        let p = parse_connstr("host=db port=5432 sslmode=require user=bob dbname=prod");
+        assert_eq!(p.sslmode, Some("require".to_string()));
+    }
+
+    #[test]
+    fn parse_keyvalue_quoted_password() {
+        let p = parse_connstr("host=db user=alice password='my pass' dbname=mydb");
+        assert_eq!(p.password, "my pass");
+    }
+
+    #[test]
+    fn parse_keyvalue_quoted_password_with_quotes() {
+        // libpq uses backslash escaping inside single quotes: \' for a literal quote
+        let p = parse_connstr(r"host=db user=alice password='it\'s a test' dbname=mydb");
+        assert_eq!(p.password, "it's a test");
+    }
+
+    #[test]
+    fn parse_keyvalue_quoted_password_with_backslash() {
+        let p = parse_connstr(r"host=db user=alice password='back\\slash' dbname=mydb");
+        assert_eq!(p.password, "back\\slash");
+    }
+
+    #[test]
+    fn parse_keyvalue_defaults() {
+        let p = parse_connstr("");
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.port, 5432);
+        assert_eq!(p.dbname, "postgres");
+    }
+
+    // --- parse_connstr: URI format ---
+
+    #[test]
+    fn parse_simple_uri() {
+        let p = parse_connstr("postgresql://alice:secret@db.example.com:5433/mydb");
+        assert_eq!(p.host, "db.example.com");
+        assert_eq!(p.port, 5433);
+        assert_eq!(p.user, "alice");
+        assert_eq!(p.password, "secret");
+        assert_eq!(p.dbname, "mydb");
+    }
+
+    #[test]
+    fn parse_uri_with_sslmode() {
+        let p = parse_connstr("postgresql://alice@db/mydb?sslmode=verify-full");
+        assert_eq!(p.sslmode, Some("verify-full".to_string()));
+    }
+
+    #[test]
+    fn parse_uri_percent_encoded_password() {
+        let p = parse_connstr("postgresql://alice:p%40ss%3Dword@db/mydb");
+        assert_eq!(p.password, "p@ss=word");
+    }
+
+    #[test]
+    fn parse_uri_postgres_scheme() {
+        let p = parse_connstr("postgres://bob@localhost/testdb");
+        assert_eq!(p.user, "bob");
+        assert_eq!(p.dbname, "testdb");
+    }
+
+    // --- url_decode: UTF-8 multi-byte ---
+
+    #[test]
+    fn url_decode_ascii() {
+        assert_eq!(url_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn url_decode_multibyte_utf8() {
+        // é = U+00E9 = UTF-8 bytes C3 A9
+        assert_eq!(url_decode("%C3%A9"), "é");
+    }
+
+    #[test]
+    fn url_decode_no_encoding() {
+        assert_eq!(url_decode("plain"), "plain");
+    }
+
+    // --- build_tokio_pg_connstr: value quoting ---
+
+    #[test]
+    fn build_connstr_simple() {
+        let p = ConnParams {
+            host: "localhost".into(),
+            port: 5432,
+            user: "alice".into(),
+            password: String::new(),
+            dbname: "mydb".into(),
+            sslmode: None,
+        };
+        let s = build_tokio_pg_connstr(&p);
+        assert_eq!(s, "host=localhost port=5432 user=alice dbname=mydb");
+    }
+
+    #[test]
+    fn build_connstr_password_with_spaces() {
+        let p = ConnParams {
+            host: "localhost".into(),
+            port: 5432,
+            user: "alice".into(),
+            password: "my password".into(),
+            dbname: "mydb".into(),
+            sslmode: None,
+        };
+        let s = build_tokio_pg_connstr(&p);
+        assert!(s.contains("password='my password'"));
+    }
+
+    #[test]
+    fn build_connstr_password_with_quotes() {
+        let p = ConnParams {
+            host: "localhost".into(),
+            port: 5432,
+            user: "alice".into(),
+            password: "it's".into(),
+            dbname: "mydb".into(),
+            sslmode: None,
+        };
+        let s = build_tokio_pg_connstr(&p);
+        assert!(s.contains(r"password='it\'s'"));
+    }
+
+    // --- sslmode_needs_tls ---
+
+    #[test]
+    fn sslmode_require_needs_tls() {
+        assert!(sslmode_needs_tls(&Some("require".into())));
+        assert!(sslmode_needs_tls(&Some("verify-full".into())));
+        assert!(sslmode_needs_tls(&Some("prefer".into())));
+    }
+
+    #[test]
+    fn sslmode_disable_no_tls() {
+        assert!(!sslmode_needs_tls(&None));
+        assert!(!sslmode_needs_tls(&Some("disable".into())));
+        assert!(!sslmode_needs_tls(&Some("allow".into())));
+    }
+
+    // --- round-trip: parse → build → re-parse ---
+
+    #[test]
+    fn roundtrip_keyvalue() {
+        let original = "host=db.example.com port=5433 user=alice dbname=mydb sslmode=require";
+        let p1 = parse_connstr(original);
+        let rebuilt = build_tokio_pg_connstr(&p1);
+        let p2 = parse_connstr(&rebuilt);
+        assert_eq!(p1.host, p2.host);
+        assert_eq!(p1.port, p2.port);
+        assert_eq!(p1.user, p2.user);
+        assert_eq!(p1.dbname, p2.dbname);
+        assert_eq!(p1.sslmode, p2.sslmode);
+    }
+
+    #[test]
+    fn roundtrip_quoted_password() {
+        let original = "host=db user=alice password='s3cr3t w1th sp@ces' dbname=mydb";
+        let p1 = parse_connstr(original);
+        assert_eq!(p1.password, "s3cr3t w1th sp@ces");
+        let rebuilt = build_tokio_pg_connstr(&p1);
+        let p2 = parse_connstr(&rebuilt);
+        assert_eq!(p1.password, p2.password);
     }
 }

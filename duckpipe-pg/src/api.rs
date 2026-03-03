@@ -14,15 +14,23 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 /// Connect to a remote PG via tokio-postgres with automatic TLS negotiation.
-/// Returns the client; spawns the connection driver on the runtime.
-async fn remote_connect(conninfo: &str) -> Result<tokio_postgres::Client, String> {
+/// Returns `(Client, JoinHandle)` — the handle drives the connection and must be
+/// kept alive as long as the client is in use.
+async fn remote_connect(
+    conninfo: &str,
+) -> Result<
+    (
+        tokio_postgres::Client,
+        tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    ),
+    String,
+> {
     let connstr = duckpipe_core::connstr::build_tokio_pg_connstr(
         &duckpipe_core::connstr::parse_connstr(conninfo),
     );
-    let (client, _handle) = duckpipe_core::connstr::pg_connect(&connstr)
+    duckpipe_core::connstr::pg_connect(&connstr)
         .await
-        .map_err(|e| format!("remote connect: {}", e))?;
-    Ok(client)
+        .map_err(|e| format!("remote connect: {}", e))
 }
 
 /// Execute a SQL statement via raw SPI without marking the transaction as mutable.
@@ -31,6 +39,25 @@ async fn remote_connect(conninfo: &str) -> Result<tokio_postgres::Client, String
 unsafe fn spi_exec_raw(sql: &str) -> i32 {
     let c_sql = std::ffi::CString::new(sql).unwrap();
     pg_sys::SPI_execute(c_sql.as_ptr(), false, 0)
+}
+
+/// Redact the password from a conninfo string for display purposes.
+/// Replaces `password=...` with `password=********`.
+fn redact_conninfo_password(conninfo: &str) -> String {
+    let params = duckpipe_core::connstr::parse_connstr(conninfo);
+    let mut parts = vec![
+        format!("host={}", params.host),
+        format!("port={}", params.port),
+        format!("user={}", params.user),
+        format!("dbname={}", params.dbname),
+    ];
+    if !params.password.is_empty() {
+        parts.push("password=********".to_string());
+    }
+    if let Some(ref mode) = params.sslmode {
+        parts.push(format!("sslmode={}", mode));
+    }
+    parts.join(" ")
 }
 
 /// Parse a source_table argument into (schema, table) parts
@@ -169,7 +196,7 @@ fn create_group(
         let slot_owned = slot.clone();
         let pub_owned = pub_name.clone();
         let result: Result<(), String> = block_on(async {
-            let client = remote_connect(&ci_owned).await?;
+            let (client, _conn) = remote_connect(&ci_owned).await?;
 
             // Create replication slot on remote
             client
@@ -226,8 +253,9 @@ fn create_group(
         });
     }
 
-    // Insert into sync_groups (always local metadata)
-    Spi::connect_mut(|client| {
+    // Insert into sync_groups (always local metadata).
+    // If this fails for a remote group, clean up the remote slot+publication.
+    let insert_result: Result<(), String> = Spi::connect_mut(|client| {
         if conninfo.is_some() {
             let args = unsafe {
                 [
@@ -244,13 +272,7 @@ fn create_group(
                     None,
                     &args,
                 )
-                .unwrap_or_else(|e| {
-                    ereport!(
-                        ERROR,
-                        PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-                        format!("Failed to insert into sync_groups: {}", e)
-                    );
-                });
+                .map_err(|e| format!("Failed to insert into sync_groups: {}", e))?;
         } else {
             let args = unsafe {
                 [
@@ -266,15 +288,29 @@ fn create_group(
                     None,
                     &args,
                 )
-                .unwrap_or_else(|e| {
-                    ereport!(
-                        ERROR,
-                        PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-                        format!("Failed to insert into sync_groups: {}", e)
-                    );
-                });
+                .map_err(|e| format!("Failed to insert into sync_groups: {}", e))?;
         }
+        Ok(())
     });
+
+    if let Err(e) = insert_result {
+        // Compensating cleanup: drop remote objects if they were created
+        if let Some(ci) = conninfo {
+            let ci = ci.to_string();
+            let slot_c = slot.clone();
+            let pub_c = pub_name.clone();
+            let _ = block_on(async {
+                if let Ok((client, _conn)) = remote_connect(&ci).await {
+                    let _ = client
+                        .execute("SELECT pg_drop_replication_slot($1)", &[&slot_c])
+                        .await;
+                    let sql = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(&pub_c));
+                    let _ = client.execute(&sql, &[]).await;
+                }
+            });
+        }
+        ereport!(ERROR, PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, e);
+    }
 
     name.to_string()
 }
@@ -358,7 +394,7 @@ fn drop_group(name: &str, drop_slot: bool) {
         let slot = slot.clone();
         let pub_name = pub_name.clone();
         let result: Result<(), String> = block_on(async {
-            let client = remote_connect(&ci).await?;
+            let (client, _conn) = remote_connect(&ci).await?;
             if drop_slot {
                 let _ = client
                     .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
@@ -699,7 +735,7 @@ fn add_table_remote(
 
     let remote_info: RemoteTableInfo = {
         let result: Result<RemoteTableInfo, String> = block_on(async {
-            let client = remote_connect(&ci).await?;
+            let (client, _conn) = remote_connect(&ci).await?;
 
             // ALTER PUBLICATION ADD TABLE on remote
             let sql = format!(
@@ -806,7 +842,8 @@ fn add_table_remote(
     };
 
     // 2. Local DDL + metadata INSERT via SPI.
-    Spi::connect_mut(|client| {
+    //    If this fails, compensate by removing the table from the remote publication.
+    let local_result: Result<(), String> = Spi::connect_mut(|client| {
         // Auto-create target schema if needed
         {
             let args = unsafe { [DatumWithOid::new(t_schema, PgBuiltInOids::TEXTOID.value())] };
@@ -824,6 +861,17 @@ fn add_table_remote(
         // Build explicit CREATE TABLE DDL from remote introspection.
         // DuckLake doesn't support PRIMARY KEY constraints in CREATE TABLE,
         // so we create the table without PK — same as the local LIKE path.
+        //
+        // Sanitize type_str: format_type() output from the remote PG is untrusted.
+        // Reject any type string containing SQL injection markers.
+        for (name, type_str) in &remote_info.col_defs {
+            if type_str.contains(';') || type_str.contains("--") || type_str.contains("/*") {
+                return Err(format!(
+                    "suspicious type '{}' for column '{}' from remote PG — refusing to interpolate",
+                    type_str, name
+                ));
+            }
+        }
         let col_clauses: Vec<String> = remote_info
             .col_defs
             .iter()
@@ -836,7 +884,9 @@ fn add_table_remote(
             quote_ident(t_table),
             col_clauses.join(", "),
         );
-        client.update(&sql, None, &[]).unwrap();
+        client
+            .update(&sql, None, &[])
+            .map_err(|e| format!("CREATE TABLE: {}", e))?;
 
         // Set data inlining if configured
         let inlining_limit = DATA_INLINING_ROW_LIMIT.get();
@@ -870,8 +920,33 @@ fn add_table_remote(
                 None,
                 &args,
             )
-            .unwrap();
+            .map_err(|e| format!("INSERT mapping: {}", e))?;
+        Ok(())
     });
+
+    if let Err(e) = local_result {
+        // Compensating cleanup: remove table from remote publication
+        let ci = conninfo.to_string();
+        let pub_c = publication.clone();
+        let schema_c = schema.to_string();
+        let table_c = table.to_string();
+        let _ = block_on(async {
+            if let Ok((client, _conn)) = remote_connect(&ci).await {
+                let sql = format!(
+                    "ALTER PUBLICATION {} DROP TABLE {}.{}",
+                    quote_ident(&pub_c),
+                    quote_ident(&schema_c),
+                    quote_ident(&table_c)
+                );
+                let _ = client.execute(&sql, &[]).await;
+            }
+        });
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("Failed to set up local target: {}", e)
+        );
+    }
 }
 
 #[pg_extern(sql = "
@@ -975,7 +1050,7 @@ fn remove_table(source_table: &str, drop_target: Option<bool>) {
         let schema = schema.clone();
         let table = table.clone();
         let result: Result<(), String> = block_on(async {
-            let client = remote_connect(&ci).await?;
+            let (client, _conn) = remote_connect(&ci).await?;
             let sql = format!(
                 "ALTER PUBLICATION {} DROP TABLE {}.{}",
                 quote_ident(&pub_name),
@@ -1003,6 +1078,101 @@ REVOKE ALL ON FUNCTION duckpipe.move_table(TEXT, TEXT) FROM PUBLIC;
 fn move_table(source_table: &str, new_group: &str) {
     let (schema, table) = parse_source_table(source_table);
 
+    // Fetch old and new group publication names and conninfo for publication updates.
+    let (old_pub, old_ci, new_pub, new_ci): (String, Option<String>, String, Option<String>) =
+        Spi::connect(|client| {
+            let args = unsafe {
+                [
+                    DatumWithOid::new(schema.as_str(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(table.as_str(), PgBuiltInOids::TEXTOID.value()),
+                    DatumWithOid::new(new_group, PgBuiltInOids::TEXTOID.value()),
+                ]
+            };
+            let result = client
+                .select(
+                    "SELECT og.publication, og.conninfo, ng.publication, ng.conninfo \
+                     FROM duckpipe.table_mappings m \
+                     JOIN duckpipe.sync_groups og ON m.group_id = og.id \
+                     CROSS JOIN duckpipe.sync_groups ng \
+                     WHERE m.source_schema = $1 AND m.source_table = $2 AND ng.name = $3",
+                    Some(1),
+                    &args,
+                )
+                .unwrap();
+            for r in result {
+                return (
+                    r.get::<String>(1).unwrap().unwrap(),
+                    r.get::<String>(2).unwrap(),
+                    r.get::<String>(3).unwrap().unwrap(),
+                    r.get::<String>(4).unwrap(),
+                );
+            }
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
+                format!("Table mapping or target group '{}' not found", new_group)
+            );
+        });
+
+    // Drop from old group's publication
+    if let Some(ref ci) = old_ci {
+        let ci = ci.clone();
+        let pub_name = old_pub.clone();
+        let s = schema.clone();
+        let t = table.clone();
+        let _ = block_on(async {
+            if let Ok((client, _conn)) = remote_connect(&ci).await {
+                let sql = format!(
+                    "ALTER PUBLICATION {} DROP TABLE {}.{}",
+                    quote_ident(&pub_name),
+                    quote_ident(&s),
+                    quote_ident(&t)
+                );
+                let _ = client.execute(&sql, &[]).await;
+            }
+        });
+    } else {
+        Spi::connect_mut(|client| {
+            let sql = format!(
+                "ALTER PUBLICATION {} DROP TABLE {}.{}",
+                quote_ident(&old_pub),
+                quote_ident(&schema),
+                quote_ident(&table)
+            );
+            let _ = client.update(&sql, None, &[]);
+        });
+    }
+
+    // Add to new group's publication
+    if let Some(ref ci) = new_ci {
+        let ci = ci.clone();
+        let pub_name = new_pub.clone();
+        let s = schema.clone();
+        let t = table.clone();
+        let _ = block_on(async {
+            if let Ok((client, _conn)) = remote_connect(&ci).await {
+                let sql = format!(
+                    "ALTER PUBLICATION {} ADD TABLE {}.{}",
+                    quote_ident(&pub_name),
+                    quote_ident(&s),
+                    quote_ident(&t)
+                );
+                let _ = client.execute(&sql, &[]).await;
+            }
+        });
+    } else {
+        Spi::connect_mut(|client| {
+            let sql = format!(
+                "ALTER PUBLICATION {} ADD TABLE {}.{}",
+                quote_ident(&new_pub),
+                quote_ident(&schema),
+                quote_ident(&table)
+            );
+            let _ = client.update(&sql, None, &[]);
+        });
+    }
+
+    // Update the group_id in the mapping
     Spi::connect_mut(|client| {
         let args = unsafe {
             [
@@ -1151,7 +1321,10 @@ fn groups() -> TableIterator<
                 let enabled: bool = row.get(4).unwrap().unwrap();
                 let table_count: i32 = row.get(5).unwrap().unwrap();
                 let last_sync: Option<TimestampWithTimeZone> = row.get(6).unwrap();
-                let conninfo: Option<String> = row.get(7).unwrap();
+                let conninfo: Option<String> = row
+                    .get::<String>(7)
+                    .unwrap()
+                    .map(|ci| redact_conninfo_password(&ci));
 
                 rows.push((
                     name,
