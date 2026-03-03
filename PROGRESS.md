@@ -72,6 +72,7 @@
 - [ ] Schema DDL sync (ALTER TABLE ADD/DROP COLUMN propagation)
 - [ ] Sync tables with no PK (ensure e2e EOS)
 - [ ] CI: `cargo chef` pattern for cached Rust dependency compilation
+- [ ] CI: run `cargo test` for unit tests (e.g. `connstr` module) — currently only `make installcheck` regression tests are in CI
 
 ### Monitoring / Observability
 - [ ] `applied_lsn` stays NULL during SNAPSHOT/CATCHUP — should be set to `snapshot_lsn` after snapshot completes
