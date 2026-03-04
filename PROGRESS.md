@@ -65,6 +65,7 @@
 
 ### Features
 - [ ] Dedicated bgworker per group — one worker per sync group for full isolation (own FlushCoordinator, SnapshotManager, SlotState)
+- [ ] Per-group NOTIFY channels (`duckpipe_wakeup_{group}`) — avoid thundering herd wakeups; depends on per-group bgworker
 - [ ] Per-group GUC overrides — nullable config columns in `sync_groups`; NULL falls back to global GUC
 - [ ] `source_uri` column for pg_mooncake compatibility
 - [ ] `conninfo` column in sync_groups for remote PG support
