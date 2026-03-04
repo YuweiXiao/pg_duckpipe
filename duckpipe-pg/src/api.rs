@@ -1574,6 +1574,14 @@ LANGUAGE C;
 REVOKE ALL ON FUNCTION duckpipe.stop_worker() FROM PUBLIC;
 ")]
 fn stop_worker() {
+    // Wake the worker from any long poll_interval sleep so it can check
+    // ShutdownRequestPending promptly after receiving SIGTERM.  Without
+    // this, pg_terminate_backend sets the flag but the tokio event loop
+    // may not re-check it until the current sleep/select expires.
+    Spi::connect_mut(|client| {
+        let _ = client.update("NOTIFY duckpipe_wakeup", None, &[]);
+    });
+
     let terminated: i64 = Spi::connect_mut(|client| {
         let result = client.update(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = 'pg_duckpipe'",
