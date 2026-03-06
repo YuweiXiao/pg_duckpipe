@@ -68,6 +68,19 @@ SELECT duckpipe.drop_group('analytics');
 SELECT duckpipe.drop_group('analytics', false);
 ```
 
+### Remote Sync
+
+Sync tables from a remote PostgreSQL instance by providing a `conninfo` connection string:
+
+```sql
+SELECT duckpipe.create_group('remote_oltp',
+    conninfo => 'host=prod-db.example.com port=5432 dbname=myapp user=replicator password=secret');
+
+SELECT duckpipe.add_table('public.orders', sync_group => 'remote_oltp');
+```
+
+See **[Remote Sync](REMOTE_SYNC.md)** for connection string formats, TLS configuration, and details.
+
 ### Worker Control
 
 The background worker starts automatically when `add_table()` is called. Manual control:

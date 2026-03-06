@@ -4,6 +4,10 @@
 # Usage: fetch-ducklake-ext.sh [duckdb-version]
 # Default version: v1.4.3  (must match libduckdb.so shipped by pg_ducklake)
 #
+# NOTE: postgres_scanner (a ducklake dependency) must be bundled by pg_ducklake.
+# The version on extensions.duckdb.org lacks the -Bsymbolic fix
+# (duckdb/duckdb-postgres#402) needed to run inside a PG backend.
+#
 # Installs to: /var/lib/postgresql/.duckdb/extensions/<ver>/<arch>/ducklake.duckdb_extension
 
 set -euo pipefail
