@@ -88,8 +88,8 @@ pub fn make_rustls_config() -> rustls::ClientConfig {
     // aws-lc-rs features are pulled in by transitive dependencies.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()

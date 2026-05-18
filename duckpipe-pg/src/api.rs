@@ -103,6 +103,13 @@ fn datum_text(s: &str) -> DatumWithOid<'_> {
     unsafe { DatumWithOid::new(s, PgBuiltInOids::TEXTOID.value()) }
 }
 
+/// Construct a text-typed SPI parameter.
+///
+/// SAFETY: TEXTOID is the correct OID for `&str`'s `IntoDatum` impl.
+fn datum_null_text() -> DatumWithOid<'static> {
+    unsafe { DatumWithOid::null_oid(PgBuiltInOids::TEXTOID.value()) }
+}
+
 /// Construct an int4-typed SPI parameter.
 ///
 /// SAFETY: INT4OID is the correct OID for `i32`'s `IntoDatum` impl.
@@ -397,51 +404,39 @@ fn create_group(
 
             // Create publication
             let sql = format!("CREATE PUBLICATION {}", quote_ident(&pub_name));
-            client.update(&sql, None, &[]).unwrap_or_else(|e| {
+            if let Err(e) = client.update(&sql, None, &[]) {
                 ereport!(
                     ERROR,
                     PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
                     format!("Failed to create publication {}: {}", pub_name, e)
                 );
-            });
+            }
         });
     }
 
     // Insert into sync_groups (always local metadata).
     // If this fails for a remote group, clean up the remote slot+publication.
     let insert_result: Result<(), String> = Spi::connect_mut(|client| {
-        if conninfo.is_some() {
-            let args = [
-                datum_text(name),
-                datum_text(&pub_name),
-                datum_text(slot.as_str()),
-                datum_text(conninfo.unwrap()),
-                datum_text(mode_val),
-            ];
-            client
-                .update(
-                    "INSERT INTO duckpipe.sync_groups (name, publication, slot_name, conninfo, mode) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                    None,
-                    &args,
-                )
-                .map_err(|e| format!("Failed to insert into sync_groups: {}", e))?;
-        } else {
-            let args = [
-                datum_text(name),
-                datum_text(&pub_name),
-                datum_text(slot.as_str()),
-                datum_text(mode_val),
-            ];
-            client
-                .update(
-                    "INSERT INTO duckpipe.sync_groups (name, publication, slot_name, mode) \
-                     VALUES ($1, $2, $3, $4)",
-                    None,
-                    &args,
-                )
-                .map_err(|e| format!("Failed to insert into sync_groups: {}", e))?;
-        }
+        client
+            .update(
+                "INSERT INTO duckpipe.sync_groups
+                    (name, publication, slot_name, conninfo, mode)
+                 VALUES
+                    ($1, $2, $3, $4, $5)",
+                None,
+                &[
+                    datum_text(name),
+                    datum_text(&pub_name),
+                    datum_text(slot.as_str()),
+                    if let Some(conninfo) = conninfo {
+                        datum_text(conninfo)
+                    } else {
+                        datum_null_text()
+                    },
+                    datum_text(mode_val),
+                ],
+            )
+            .map_err(|e| format!("Failed to insert into sync_groups: {}", e))?;
         Ok(())
     });
 
@@ -502,24 +497,17 @@ fn drop_group(name: &str) {
                 );
             });
 
-        let mut found = false;
-
-        for r in row {
-            pub_name = r.get::<String>(1).unwrap().unwrap();
-            slot = r.get::<String>(2).unwrap().unwrap();
-            group_conninfo = r.get::<String>(3).unwrap();
-            group_id = r.get::<i32>(4).unwrap();
-            found = true;
-            break;
-        }
-
-        if !found {
+        let r = row.into_iter().next().unwrap_or_else(|| {
             ereport!(
                 ERROR,
                 PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
                 format!("Sync group not found: {}", name)
             );
-        }
+        });
+        pub_name = r.get::<String>(1).unwrap().unwrap();
+        slot = r.get::<String>(2).unwrap().unwrap();
+        group_conninfo = r.get::<String>(3).unwrap();
+        group_id = r.get::<i32>(4).unwrap();
 
         if group_conninfo.is_some() {
             // Remote group: slot + publication cleanup via tokio-postgres (done below)
@@ -1993,21 +1981,15 @@ fn set_table_config(source_table: &str, key: &str, value: &str) {
                 &args,
             )
             .unwrap();
-        let mut found = false;
-        let mut config = TableConfig::default();
-        for row in result {
-            found = true;
-            if let Some(config_str) = row.get::<String>(1).unwrap() {
-                config = TableConfig::from_json_str(&config_str).unwrap_or_default();
-            }
-        }
-        if !found {
+        let row = result.into_iter().next().unwrap_or_else(|| {
             pgrx::error!(
                 "table {}.{} not found in duckpipe.table_mappings",
                 schema,
                 table
             );
-        }
+        });
+        let mut config =
+            TableConfig::from_json_str_or_default(row.get::<String>(1).unwrap().as_deref());
 
         config.set_key(key, value).unwrap();
         let config_json = config.to_json_string();
@@ -2066,25 +2048,17 @@ fn get_table_config(source_table: &str, key: default!(Option<&str>, "NULL")) -> 
                 &table_args,
             )
             .unwrap();
-        let mut found = false;
-        let mut group_config = GroupConfig::default();
-        let mut table_config = TableConfig::default();
-        for row in result {
-            found = true;
-            if let Some(g_str) = row.get::<String>(1).unwrap() {
-                group_config = GroupConfig::from_json_str(&g_str).unwrap_or_default();
-            }
-            if let Some(t_str) = row.get::<String>(2).unwrap() {
-                table_config = TableConfig::from_json_str(&t_str).unwrap_or_default();
-            }
-        }
-        if !found {
+        let row = result.into_iter().next().unwrap_or_else(|| {
             pgrx::error!(
                 "table {}.{} not found in duckpipe.table_mappings",
                 schema,
                 table
             );
-        }
+        });
+        let group_config =
+            GroupConfig::from_json_str_or_default(row.get::<String>(1).unwrap().as_deref());
+        let table_config =
+            TableConfig::from_json_str_or_default(row.get::<String>(2).unwrap().as_deref());
 
         let resolved =
             ResolvedConfig::resolve(&global, &group_config).resolve_for_table(&table_config);
@@ -2654,17 +2628,11 @@ fn set_group_config(group_name: &str, key: &str, value: &str) {
                 &args,
             )
             .unwrap();
-        let mut found = false;
-        let mut config = GroupConfig::default();
-        for row in result {
-            found = true;
-            if let Some(config_str) = row.get::<String>(1).unwrap() {
-                config = GroupConfig::from_json_str(&config_str).unwrap_or_default();
-            }
-        }
-        if !found {
+        let row = result.into_iter().next().unwrap_or_else(|| {
             error!("sync group '{}' does not exist", group_name);
-        }
+        });
+        let mut config =
+            GroupConfig::from_json_str_or_default(row.get::<String>(1).unwrap().as_deref());
 
         // Set the key in the config
         config.set_key(key, value).unwrap();
@@ -2715,17 +2683,11 @@ fn get_group_config(group_name: &str, key: default!(Option<&str>, "NULL")) -> Op
                 &args,
             )
             .unwrap();
-        let mut found = false;
-        let mut group_config = GroupConfig::default();
-        for row in result {
-            found = true;
-            if let Some(config_str) = row.get::<String>(1).unwrap() {
-                group_config = GroupConfig::from_json_str(&config_str).unwrap_or_default();
-            }
-        }
-        if !found {
+        let row = result.into_iter().next().unwrap_or_else(|| {
             error!("sync group '{}' does not exist", group_name);
-        }
+        });
+        let group_config =
+            GroupConfig::from_json_str_or_default(row.get::<String>(1).unwrap().as_deref());
 
         let resolved = ResolvedConfig::resolve(&global, &group_config);
 
