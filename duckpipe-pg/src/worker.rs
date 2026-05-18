@@ -232,23 +232,16 @@ pub extern "C-unwind" fn duckpipe_worker_main(arg: pg_sys::Datum) {
     let group_id: i32 = unsafe {
         pg_sys::StartTransactionCommand();
         pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
-        let gid = Spi::connect(|client| {
-            let args = [DatumWithOid::new(
+        let gid = Spi::get_one_with_args::<i32>(
+            "SELECT id FROM duckpipe.sync_groups WHERE name = $1",
+            &[DatumWithOid::new(
                 group_name.as_str(),
                 PgBuiltInOids::TEXTOID.value(),
-            )];
-            let result = client
-                .select(
-                    "SELECT id FROM duckpipe.sync_groups WHERE name = $1",
-                    Some(1),
-                    &args,
-                )
-                .unwrap();
-            for r in result {
-                return r.get::<i32>(1).unwrap().unwrap_or(0);
-            }
-            0
-        });
+            )],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0);
         pg_sys::PopActiveSnapshot();
         pg_sys::CommitTransactionCommand();
         gid
