@@ -115,66 +115,41 @@ pub fn write_shmem_metrics(group: &GroupMetrics, tables: &[TableMetrics]) {
     let mut shm = METRICS_SHM.exclusive();
 
     // Group metrics
-    let bp = if group.is_backpressured { 1 } else { 0 };
-    let mut found_group = false;
-    for slot in shm.groups.iter_mut() {
-        if slot.group_id == group.group_id {
-            slot.total_queued_bytes = group.total_queued_bytes;
-            slot.is_backpressured = bp;
-            slot.active_flushes = group.active_flushes;
-            slot.gate_wait_avg_ms = group.gate_wait_avg_ms;
-            slot.gate_timeouts = group.gate_timeouts;
-            slot.pending_lsn = group.pending_lsn as i64;
-            found_group = true;
-            break;
-        }
-        if slot.group_id == 0 {
-            *slot = GroupMetricsSlot {
-                group_id: group.group_id,
-                total_queued_bytes: group.total_queued_bytes,
-                is_backpressured: bp,
-                active_flushes: group.active_flushes,
-                gate_wait_avg_ms: group.gate_wait_avg_ms,
-                gate_timeouts: group.gate_timeouts,
-                pending_lsn: group.pending_lsn as i64,
-            };
-            found_group = true;
-            break;
-        }
-    }
-    if !found_group {
+    if let Some(slot) = shm
+        .groups
+        .iter_mut()
+        .find(|slot| slot.group_id == 0 || slot.group_id == group.group_id)
+    {
+        slot.group_id = group.group_id;
+        slot.total_queued_bytes = group.total_queued_bytes;
+        slot.is_backpressured = if group.is_backpressured { 1 } else { 0 };
+        slot.active_flushes = group.active_flushes;
+        slot.gate_wait_avg_ms = group.gate_wait_avg_ms;
+        slot.gate_timeouts = group.gate_timeouts;
+        slot.pending_lsn = group.pending_lsn as i64;
+    } else {
         tracing::warn!("duckpipe: SHM group slots full ({MAX_METRICS_GROUPS}), metrics for group_id={} dropped", group.group_id);
     }
 
-    // Per-table metrics
+    // Per-table metrics. Two-pass index lookup keeps the &mut borrow scoped to the
+    // write, so we don't fight the borrow checker over re-borrowing shm.tables.
     for t in tables {
-        let mut free_idx: Option<usize> = None;
-        let mut found = false;
-        for (i, slot) in shm.tables.iter_mut().enumerate() {
-            if slot.mapping_id == t.mapping_id {
+        let target_idx = shm
+            .tables
+            .iter()
+            .position(|s| s.mapping_id == t.mapping_id)
+            .or_else(|| shm.tables.iter().position(|s| s.mapping_id == 0));
+        match target_idx {
+            Some(idx) => {
+                let slot = &mut shm.tables[idx];
+                slot.mapping_id = t.mapping_id;
                 slot.queued_changes = t.queued_changes;
                 slot.duckdb_memory_bytes = t.duckdb_memory_bytes;
                 slot.flush_count = t.flush_count;
                 slot.flush_duration_ms = t.flush_duration_ms;
                 slot.avg_row_bytes = t.avg_row_bytes;
-                found = true;
-                break;
             }
-            if slot.mapping_id == 0 && free_idx.is_none() {
-                free_idx = Some(i);
-            }
-        }
-        if !found {
-            if let Some(idx) = free_idx {
-                shm.tables[idx] = TableMetricsSlot {
-                    mapping_id: t.mapping_id,
-                    queued_changes: t.queued_changes,
-                    duckdb_memory_bytes: t.duckdb_memory_bytes,
-                    flush_count: t.flush_count,
-                    flush_duration_ms: t.flush_duration_ms,
-                    avg_row_bytes: t.avg_row_bytes,
-                };
-            } else {
+            None => {
                 tracing::warn!("duckpipe: SHM table slots full ({MAX_METRICS_TABLES}), metrics for mapping_id={} dropped", t.mapping_id);
             }
         }
@@ -187,18 +162,19 @@ pub fn clear_shmem_table_slot(mapping_id: i32) {
         return;
     }
     let mut shm = METRICS_SHM.exclusive();
-    for slot in shm.tables.iter_mut() {
-        if slot.mapping_id == mapping_id {
-            *slot = TableMetricsSlot {
-                mapping_id: 0,
-                queued_changes: 0,
-                duckdb_memory_bytes: 0,
-                flush_count: 0,
-                flush_duration_ms: 0,
-                avg_row_bytes: 0,
-            };
-            return;
-        }
+    if let Some(slot) = shm
+        .tables
+        .iter_mut()
+        .find(|slot| slot.mapping_id == mapping_id)
+    {
+        *slot = TableMetricsSlot {
+            mapping_id: 0,
+            queued_changes: 0,
+            duckdb_memory_bytes: 0,
+            flush_count: 0,
+            flush_duration_ms: 0,
+            avg_row_bytes: 0,
+        };
     }
 }
 
@@ -208,19 +184,74 @@ pub fn clear_shmem_group_slot(group_id: i32) {
         return;
     }
     let mut shm = METRICS_SHM.exclusive();
-    for slot in shm.groups.iter_mut() {
-        if slot.group_id == group_id {
-            *slot = GroupMetricsSlot {
-                group_id: 0,
-                total_queued_bytes: 0,
-                is_backpressured: 0,
-                active_flushes: 0,
-                gate_wait_avg_ms: 0,
-                gate_timeouts: 0,
-                pending_lsn: 0,
-            };
-            return;
-        }
+    if let Some(slot) = shm.groups.iter_mut().find(|slot| slot.group_id == group_id) {
+        *slot = GroupMetricsSlot {
+            group_id: 0,
+            total_queued_bytes: 0,
+            is_backpressured: 0,
+            active_flushes: 0,
+            gate_wait_avg_ms: 0,
+            gate_timeouts: 0,
+            pending_lsn: 0,
+        };
+    }
+}
+
+pub trait ReadMetrics {
+    fn read_shmem_table_metrics(&self) -> std::collections::HashMap<i32, TableMetrics>;
+    fn read_shmem_group_metrics(&self) -> std::collections::HashMap<i32, GroupMetrics>;
+    fn read_shmem_all_metrics(
+        &self,
+    ) -> (
+        std::collections::HashMap<i32, TableMetrics>,
+        std::collections::HashMap<i32, GroupMetrics>,
+    ) {
+        (
+            self.read_shmem_table_metrics(),
+            self.read_shmem_group_metrics(),
+        )
+    }
+}
+
+impl ReadMetrics for pgrx::lwlock::PgLwLockShareGuard<'_, SharedMetrics> {
+    fn read_shmem_table_metrics(&self) -> std::collections::HashMap<i32, TableMetrics> {
+        self.tables
+            .iter()
+            .filter(|s| s.mapping_id != 0)
+            .map(|s| {
+                (
+                    s.mapping_id,
+                    TableMetrics {
+                        mapping_id: s.mapping_id,
+                        queued_changes: s.queued_changes,
+                        duckdb_memory_bytes: s.duckdb_memory_bytes,
+                        flush_count: s.flush_count,
+                        flush_duration_ms: s.flush_duration_ms,
+                        avg_row_bytes: s.avg_row_bytes,
+                    },
+                )
+            })
+            .collect()
+    }
+    fn read_shmem_group_metrics(&self) -> std::collections::HashMap<i32, GroupMetrics> {
+        self.groups
+            .iter()
+            .filter(|s| s.group_id != 0)
+            .map(|s| {
+                (
+                    s.group_id,
+                    GroupMetrics {
+                        group_id: s.group_id,
+                        total_queued_bytes: s.total_queued_bytes,
+                        is_backpressured: s.is_backpressured != 0,
+                        active_flushes: s.active_flushes,
+                        gate_wait_avg_ms: s.gate_wait_avg_ms,
+                        gate_timeouts: s.gate_timeouts,
+                        pending_lsn: s.pending_lsn as u64,
+                    },
+                )
+            })
+            .collect()
     }
 }
 

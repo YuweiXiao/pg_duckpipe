@@ -95,6 +95,13 @@ impl GroupConfig {
         serde_json::from_str(s).map_err(|e| format!("invalid config JSON: {}", e))
     }
 
+    /// Parse from an optional JSON string, falling back to default on None or parse failure.
+    /// Matches the prior call-site behaviour: NULL column -> default; malformed JSON -> default.
+    pub fn from_json_str_or_default(s: Option<&str>) -> Self {
+        s.and_then(|s| Self::from_json_str(s).ok())
+            .unwrap_or_default()
+    }
+
     pub fn to_json_string(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
@@ -186,6 +193,13 @@ pub struct TableConfig {
 impl TableConfig {
     pub fn from_json_str(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| format!("invalid table config JSON: {}", e))
+    }
+
+    /// Parse from an optional JSON string, falling back to default on None or parse failure.
+    /// Matches the prior call-site behaviour: NULL column -> default; malformed JSON -> default.
+    pub fn from_json_str_or_default(s: Option<&str>) -> Self {
+        s.and_then(|s| Self::from_json_str(s).ok())
+            .unwrap_or_default()
     }
 
     pub fn to_json_string(&self) -> String {
