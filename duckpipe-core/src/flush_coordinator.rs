@@ -8,7 +8,7 @@
 //! `drain_and_wait_all()` is retained for shutdown. TRUNCATE uses the same
 //! non-blocking barrier queue as DDL (see `DdlCommand::Truncate`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -89,17 +89,17 @@ pub struct PendingDdl {
     /// Changes received after this DDL but before the next DDL (or present).
     /// Populated by `push_change()` routing and by `set_pending_ddl()` when
     /// a subsequent barrier arrives.
-    pub post_changes: Vec<Change>,
+    pub post_changes: VecDeque<Change>,
 }
 
 /// Shared queue data protected by Mutex.
 struct SharedTableQueue {
     meta: QueueMeta,
-    changes: Vec<Change>,
+    changes: VecDeque<Change>,
     last_lsn: u64,
     /// DDL barrier queue. When non-empty, push_change routes to the last
     /// barrier's `post_changes`. Processed FIFO by the flush thread.
-    pending_ddls: std::collections::VecDeque<PendingDdl>,
+    pending_ddls: VecDeque<PendingDdl>,
     /// Estimated byte size of all changes in this queue (main + DDL post_changes).
     /// Incremented on push, decremented on drain. Single source of truth for
     /// backpressure — the WAL consumer sums this across all queues.
@@ -500,9 +500,9 @@ impl FlushCoordinator {
         let queue_handle = Arc::new(TableQueueHandle {
             inner: Mutex::new(SharedTableQueue {
                 meta: meta.clone(),
-                changes: Vec::new(),
+                changes: VecDeque::new(),
                 last_lsn: 0,
-                pending_ddls: std::collections::VecDeque::new(),
+                pending_ddls: VecDeque::new(),
                 queued_bytes: 0,
             }),
             condvar: Condvar::new(),
@@ -588,9 +588,9 @@ impl FlushCoordinator {
             }
             guard.queued_bytes += change_bytes;
             if let Some(last_ddl) = guard.pending_ddls.back_mut() {
-                last_ddl.post_changes.push(change);
+                last_ddl.post_changes.push_back(change);
             } else {
-                guard.changes.push(change);
+                guard.changes.push_back(change);
             }
         }
     }
