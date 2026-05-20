@@ -161,6 +161,7 @@ impl PgConn {
         })
     }
 
+    #[inline]
     fn is_remote(&self) -> bool {
         matches!(self, Self::Remote { .. })
     }
@@ -168,17 +169,11 @@ impl PgConn {
     /// Execute a DDL/DML statement (pre-formatted SQL, no parameters).
     fn execute(&self, sql: &str) -> Result<(), String> {
         match self {
-            Self::Local => Spi::connect_mut(|client| {
-                client
-                    .update(sql, None, &[])
-                    .map_err(|e| format!("SPI execute: {}", e))?;
-                Ok(())
-            }),
-            Self::Remote { rt, client, .. } => {
-                rt.block_on(async { client.execute(sql, &[]).await })
-                    .map_err(|e| format!("remote execute: {}", e))?;
-                Ok(())
-            }
+            Self::Local => Spi::run(sql).map_err(|e| format!("SPI execute: {}", e)),
+            Self::Remote { rt, client, .. } => rt
+                .block_on(async { client.execute(sql, &[]).await })
+                .map(|_| ())
+                .map_err(|e| format!("remote execute: {}", e)),
         }
     }
 
@@ -196,29 +191,6 @@ impl PgConn {
                     .block_on(async { client.query(sql, &[]).await })
                     .map_err(|e| format!("remote exists: {}", e))?;
                 Ok(!rows.is_empty())
-            }
-        }
-    }
-
-    /// Query a single i64 value (e.g. OID).
-    fn query_i64(&self, sql: &str) -> Result<i64, String> {
-        match self {
-            Self::Local => Spi::connect(|client| {
-                let result = client
-                    .select(sql, Some(1), &[])
-                    .map_err(|e| format!("SPI query_i64: {}", e))?;
-                for r in result {
-                    if let Some(v) = r.get::<i64>(1).unwrap() {
-                        return Ok(v);
-                    }
-                }
-                Err("query_i64: no rows returned".to_string())
-            }),
-            Self::Remote { rt, client, .. } => {
-                let row = rt
-                    .block_on(async { client.query_one(sql, &[]).await })
-                    .map_err(|e| format!("remote query_i64: {}", e))?;
-                Ok(row.get(0))
             }
         }
     }
@@ -251,17 +223,11 @@ impl PgConn {
 
 /// Check if a per-group pg_duckpipe worker is running.
 fn is_group_worker_running(group_name: &str) -> bool {
-    let backend_type = format!("pg_duckpipe:{}", group_name);
-    let args = [datum_text(backend_type.as_str())];
-    let result = Spi::connect(|client| {
-        let r = client.select(
-            "SELECT 1 FROM pg_stat_activity WHERE backend_type = $1",
-            Some(1),
-            &args,
-        );
-        matches!(r, Ok(t) if t.len() > 0)
-    });
-    result
+    let result = Spi::get_one_with_args::<i32>(
+        "SELECT 1 FROM pg_stat_activity WHERE backend_type = $1",
+        &[datum_text(&format!("pg_duckpipe:{}", group_name))],
+    );
+    matches!(result, Ok(Some(_)))
 }
 
 /// Check if any pg_duckpipe worker is running.
@@ -416,29 +382,24 @@ fn create_group(
 
     // Insert into sync_groups (always local metadata).
     // If this fails for a remote group, clean up the remote slot+publication.
-    let insert_result: Result<(), String> = Spi::connect_mut(|client| {
-        client
-            .update(
-                "INSERT INTO duckpipe.sync_groups
-                    (name, publication, slot_name, conninfo, mode)
-                 VALUES
-                    ($1, $2, $3, $4, $5)",
-                None,
-                &[
-                    datum_text(name),
-                    datum_text(&pub_name),
-                    datum_text(slot.as_str()),
-                    if let Some(conninfo) = conninfo {
-                        datum_text(conninfo)
-                    } else {
-                        datum_null_text()
-                    },
-                    datum_text(mode_val),
-                ],
-            )
-            .map_err(|e| format!("Failed to insert into sync_groups: {}", e))?;
-        Ok(())
-    });
+    let insert_result: Result<(), String> = Spi::run_with_args(
+        "INSERT INTO duckpipe.sync_groups
+            (name, publication, slot_name, conninfo, mode)
+         VALUES
+            ($1, $2, $3, $4, $5)",
+        &[
+            datum_text(name),
+            datum_text(&pub_name),
+            datum_text(slot.as_str()),
+            if let Some(conninfo) = conninfo {
+                datum_text(conninfo)
+            } else {
+                datum_null_text()
+            },
+            datum_text(mode_val),
+        ],
+    )
+    .map_err(|e| format!("Failed to insert into sync_groups: {}", e));
 
     if let Err(e) = insert_result {
         // Compensating cleanup: drop remote objects if they were created
@@ -475,19 +436,15 @@ fn drop_group(name: &str) {
     // Terminate the group's worker before cleanup
     terminate_group_worker(name);
 
-    let mut pub_name = String::new();
-    let mut slot = String::new();
-    let mut group_conninfo: Option<String> = None;
-    let mut group_id: Option<i32> = None;
-
-    Spi::connect_mut(|client| {
-        // Get publication, slot_name, conninfo, id
-        let args = [datum_text(name)];
+    // Read group metadata, do any local SPI cleanup, and delete the row -- all
+    // in one Spi::connect_mut block so the closure returns the fields the outer
+    // (non-SPI) code needs for remote cleanup and shmem bookkeeping.
+    let (pub_name, slot, group_conninfo, group_id) = Spi::connect_mut(|client| {
         let row = client
-            .select(
+            .update(
                 "SELECT publication, slot_name, conninfo, id FROM duckpipe.sync_groups WHERE name = $1",
-                None,
-                &args,
+                Some(1),
+                &[datum_text(name)],
             )
             .unwrap_or_else(|e| {
                 ereport!(
@@ -495,40 +452,38 @@ fn drop_group(name: &str) {
                     PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
                     format!("Failed to query sync_groups: {}", e)
                 );
-            });
-
-        let r = row.into_iter().next().unwrap_or_else(|| {
+            })
+            .first();
+        if row.is_empty() {
             ereport!(
                 ERROR,
                 PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
                 format!("Sync group not found: {}", name)
             );
-        });
-        pub_name = r.get::<String>(1).unwrap().unwrap();
-        slot = r.get::<String>(2).unwrap().unwrap();
-        group_conninfo = r.get::<String>(3).unwrap();
-        group_id = r.get::<i32>(4).unwrap();
+        }
+        let pub_name: String = row.get::<String>(1).unwrap().unwrap();
+        let slot: String = row.get::<String>(2).unwrap().unwrap();
+        let group_conninfo: Option<String> = row.get::<String>(3).unwrap();
+        let group_id: Option<i32> = row.get::<i32>(4).unwrap();
 
-        if group_conninfo.is_some() {
-            // Remote group: slot + publication cleanup via tokio-postgres (done below)
-        } else {
-            // Local group: drop slot + publication via SPI
+        // Local group: drop slot + publication via SPI. Remote groups are
+        // handled outside the SPI context below.
+        if group_conninfo.is_none() {
             let sql = format!("SELECT pg_drop_replication_slot({})", quote_literal(&slot));
             let _ = client.update(&sql, None, &[]);
-
             let sql = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(&pub_name));
             let _ = client.update(&sql, None, &[]);
         }
 
-        // Delete from sync_groups (always local)
-        let args = [datum_text(name)];
         client
             .update(
                 "DELETE FROM duckpipe.sync_groups WHERE name = $1",
                 None,
-                &args,
+                &[datum_text(name)],
             )
             .unwrap();
+
+        (pub_name, slot, group_conninfo, group_id)
     });
 
     // Remote cleanup (outside SPI context to avoid nested SPI issues)
@@ -1387,20 +1342,13 @@ fn remove_table(source_table: &str, drop_target: Option<bool>, sync_group: Optio
 
     // Warn if the group has no remaining tables (slot still holds WAL)
     if let Some(gid) = group_id {
-        let remaining: i64 = Spi::connect(|client| {
-            let args = [datum_i32(gid)];
-            let result = client
-                .select(
-                    "SELECT count(*)::bigint FROM duckpipe.table_mappings WHERE group_id = $1",
-                    None,
-                    &args,
-                )
-                .unwrap();
-            for r in result {
-                return r.get::<i64>(1).unwrap().unwrap_or(0);
-            }
-            0
-        });
+        let remaining = Spi::get_one_with_args::<i64>(
+            "SELECT count(*)::bigint FROM duckpipe.table_mappings WHERE group_id = $1",
+            &[datum_i32(gid)],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0);
         if remaining == 0 {
             warning!(
                 "Group '{}' has no remaining tables — its replication slot is still holding WAL. \
@@ -2328,35 +2276,25 @@ fn start_worker(group_name: Option<&str>) {
     match group_name {
         Some(name) => {
             // Check group mode — daemon groups should not use bgworker
-            let group_mode: Option<duckpipe_core::types::GroupMode> = Spi::connect(|client| {
-                let args = [datum_text(name)];
-                let result = client
-                    .select(
-                        "SELECT mode FROM duckpipe.sync_groups WHERE name = $1",
-                        Some(1),
-                        &args,
-                    )
-                    .unwrap();
-                for r in result {
-                    let mode_str: String = r.get::<String>(1).unwrap()?;
-                    return Some(
-                        mode_str
-                            .parse()
-                            .unwrap_or(duckpipe_core::types::GroupMode::BgWorker),
-                    );
-                }
-                None
+            let mode = Spi::get_one_with_args::<String>(
+                "SELECT mode FROM duckpipe.sync_groups WHERE name = $1",
+                &[datum_text(name)],
+            )
+            .unwrap();
+            let group_mode = mode.map(|mode| {
+                mode.parse::<duckpipe_core::types::GroupMode>()
+                    .unwrap_or(duckpipe_core::types::GroupMode::BgWorker)
             });
 
-            if group_mode.is_none() {
+            let Some(group_mode) = group_mode else {
                 ereport!(
                     ERROR,
                     PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
                     format!("Sync group '{}' not found", name)
                 );
-            }
+            };
 
-            if group_mode == Some(duckpipe_core::types::GroupMode::Daemon) {
+            if matches!(group_mode, duckpipe_core::types::GroupMode::Daemon) {
                 warning!(
                     "Group '{}' has mode 'daemon' — use the duckpipe daemon binary instead of start_worker()",
                     name
@@ -2380,34 +2318,23 @@ fn start_worker(group_name: Option<&str>) {
         }
         None => {
             // Start workers for all enabled bgworker-mode groups
-            let groups: Vec<String> = Spi::connect(|client| {
-                let mut names = Vec::new();
-                let result = client.select(
-                    "SELECT g.name FROM duckpipe.sync_groups g \
-                     WHERE g.enabled = true AND g.mode = 'bgworker' \
-                     ORDER BY g.name",
-                    None,
-                    &[],
-                );
-                if let Ok(tuptable) = result {
-                    for row in tuptable {
-                        if let Some(name) = row.get::<String>(1).unwrap() {
-                            names.push(name);
-                        }
-                    }
-                }
-                names
+            Spi::connect(|client| {
+                let started = client
+                    .select(
+                        "SELECT name FROM duckpipe.sync_groups WHERE enabled = true AND mode = 'bgworker'",
+                        None,
+                        &[],
+                    )
+                    .map(|rows| {
+                        rows.filter_map(|row| row.get::<String>(1).unwrap())
+                            .filter(|name| {
+                                !is_group_worker_running(name) && launch_worker(name)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                notice!("Started {} background worker(s)", started);
             });
-
-            let mut started = 0;
-            for name in &groups {
-                if !is_group_worker_running(name) {
-                    if launch_worker(name) {
-                        started += 1;
-                    }
-                }
-            }
-            notice!("Started {} background worker(s)", started);
         }
     }
 }
@@ -2431,51 +2358,49 @@ fn stop_worker(group_name: Option<&str>) {
                 // Wake all group workers — query sync_groups for all names
                 let result = client.select("SELECT name FROM duckpipe.sync_groups", None, &[]);
                 if let Ok(rows) = result {
-                    for r in rows {
-                        if let Some(name) = r.get::<String>(1).unwrap() {
+                    rows.into_iter()
+                        .filter_map(|row| row.get::<String>(1).unwrap())
+                        .for_each(|name| {
                             let channel = listen::wakeup_channel(&name);
                             let _ = client.update(&format!("NOTIFY {}", channel), None, &[]);
-                        }
-                    }
+                        });
                 }
             }
         }
     });
 
-    let (sql, check_fn): (String, Box<dyn Fn() -> bool>) = match group_name {
-        Some(name) => {
-            let backend_type = format!("pg_duckpipe:{}", name);
-            let n = name.to_string();
+    let (sql, is_worker_running): (String, Box<dyn Fn() -> bool>) = match group_name {
+        Some(group_name) => {
+            let backend_type = format!("pg_duckpipe:{}", group_name);
+            let group_name = group_name.to_string();
             (
                 format!(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = {}",
                     quote_literal(&backend_type)
                 ),
-                Box::new(move || is_group_worker_running(&n)),
+                Box::new(move || is_group_worker_running(&group_name)),
             )
         }
         None => (
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'pg_duckpipe:%'"
                 .to_string(),
-            Box::new(|| is_any_worker_running()),
+            Box::new(is_any_worker_running),
         ),
     };
 
-    let terminated: i64 = Spi::connect_mut(|client| {
-        let result = client.update(&sql, None, &[]);
-        match result {
-            Ok(status) => status.len() as i64,
-            Err(_) => 0,
-        }
+    let terminated = Spi::connect_mut(|client| {
+        client
+            .update(&sql, None, &[])
+            .map_or(0, |tuptable| tuptable.len())
     });
 
     if terminated > 0 {
         // Wait for the worker(s) to actually exit
-        for _ in 0..50 {
-            if !check_fn() {
-                break;
-            }
+        const TERMINATE_MAX_RETRY: usize = 50;
+        let mut retries = 0;
+        while is_worker_running() && retries < TERMINATE_MAX_RETRY {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            retries += 1;
         }
         notice!("Terminated {} worker(s)", terminated);
     } else {
@@ -2490,9 +2415,10 @@ fn terminate_group_worker(group_name: &str) {
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = {}",
         quote_literal(&backend_type)
     );
-    let terminated: i64 = Spi::connect_mut(|client| match client.update(&sql, None, &[]) {
-        Ok(status) => status.len() as i64,
-        Err(_) => 0,
+    let terminated = Spi::connect_mut(|client| {
+        client
+            .update(&sql, None, &[])
+            .map_or(0, |tuptable| tuptable.len())
     });
     if terminated > 0 {
         for _ in 0..50 {
